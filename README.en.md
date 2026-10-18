@@ -1,19 +1,18 @@
 # QQ ↔ DeepSeek Harness Bridge (qq-bridge)
 
-## 📖 Introduction
+> 📌 This repository is an **optimized fork** of [Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge) (unofficial).
+> Protocol adaptation and overall architecture come from upstream; open issues here.
 
-This repository is an **optimized fork** of [Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge) (unofficial).
-The protocol adaptation and overall architecture come from the upstream author; this fork adds substantial
-functionality, bug fixes and security hardening on top of it.
-Looking for the original? Go upstream. Issues and suggestions for the changes made here belong in this repository.
+## 🐟 What is this
 
-### ✨ What this fork improves
+A QQ bot backed by an AI agent. Talk to it in a group or a DM and it answers.
 
-- **Memory** — it remembers what you talked about, so conversations stay coherent
-- **Initiative** — it starts topics and keeps its own reminders, without waiting to be poked
-- **Stability** — happier to run for days without dropping or getting stuck
-- **Peace of mind** — conservative defaults, no leaking of sensitive data
-- **Completeness** — more tests and documentation, so problems are easier to pin down
+## ✨ Features
+
+- 🧠 **Remembers** — what you talked about, so chats stay coherent
+- 💬 **Proactive** — brings up topics on its own and keeps reminders
+- 🔧 **Reliable** — runs for days without dropping or getting stuck
+- 🔒 **Safe by default** — conservative defaults, nothing sensitive leaks
 
 > Connect QQ messages to DeepSeek Harness (DSH) agents: QQ friends/groups become DSH conversations, and agent replies (including questions and tool approvals) are sent back to QQ.
 
