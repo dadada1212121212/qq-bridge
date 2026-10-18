@@ -8,6 +8,10 @@ const tests = [
   'test-audit-bridge.mjs', 'test-audit-protocol.mjs', 'test-audit-protocol-helpers.mjs',
   'test-audit-security.mjs', 'test-audit-security-mcp.mjs',
   'test-audit-setup.mjs', 'test-audit-setup-guards.mjs',
+  // 模块接线：桥接用了某个模块的导出就必须真 import。VM 夹具会把 import 剥掉改成注入，
+  // 所以「生产缺 import」在别的测试里看不见 —— 2026-10-18 三个模块全缺 import、
+  // 测试全绿、真实进程一启动就 ReferenceError。这条网专门堵这个洞。
+  'test-module-wiring.mjs',
   // DSH 会话队列（inbox 投影）解析：0.2.0 把队列从 control baseline 的
   // `value.queues[<id>]` 挪进了 `value.projections[<id>].values.inbox`。
   // 认错形状的后果不是"少清几条"，而是**每一次退役会话都抛错**、旧任务继续跑，

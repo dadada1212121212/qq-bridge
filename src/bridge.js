@@ -42,6 +42,9 @@ import { createTokenLedger } from './token-ledger.js';
 // [patch 暴躁] 贴吧老哥模式：判定纯逻辑在 grump-mode.js（被 @ 塞长文 / 刷屏 / 反复问 / 离谱问题）
 import { resolveGrumpCfg, grumpSignalsV2, formatGrumpLineV2, grumpMoodNoteV2 } from './grump-mode.js';
 import { createMemoryDb } from './memory-db.js';
+import { createConsoleServer } from './console-server.js';
+import { createWakePrompt } from './wake-prompt.js';
+import { createSocialState } from './social-state.js';
 import {
   loadSlang,
   saveSlang,
