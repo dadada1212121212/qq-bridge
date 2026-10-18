@@ -44,6 +44,26 @@ for (const { preset, file, phoneAllowed } of GUARD_CASES) {
     try { assert.equal(typeof guard({ name }), 'string', `${preset}: must reject ${String(name)}`); }
     catch (error) { failures++; console.error(`FAIL ${error.message}`); }
   }
+  // 2026-10-19：被拒的本机/宿主工具必须拿到「讲清楚为什么用不了」的专门理由，
+  // 不能再丢回那句泛泛的「不在白名单内」——模型会以为是自己名字写错了，换个写法反复重试。
+  // 起因是一次真实的 `tool=pwsh` 调用（harness 日志里的审批事件）。
+  for (const name of ['pwsh', 'bash', 'read', 'write', 'edit', 'glob', 'grep', 'run_code', 'subagent']) {
+    try {
+      const reason = guard({ name });
+      assert.equal(typeof reason, 'string', `${preset}: 必须拒绝本机工具 ${name}`);
+      assert.ok(reason.includes('别再试'), `${preset}: ${name} 的拒绝理由必须叫它别再试（现在是：${reason}）`);
+      assert.ok(reason.includes(name), `${preset}: ${name} 的拒绝理由必须点名这个工具`);
+      assert.ok(!reason.includes('不在'), `${preset}: ${name} 不该再收到泛泛的「不在白名单内」`);
+    } catch (error) { failures++; console.error(`FAIL ${error.message}`); }
+  }
+  for (const name of ['web_search', 'web_fetch', 'advanced_search']) {
+    try {
+      const reason = guard({ name });
+      assert.equal(typeof reason, 'string', `${preset}: 必须拒绝宿主搜索 ${name}`);
+      assert.ok(reason.includes('mcp__web-search-safe__web_search'),
+        `${preset}: ${name} 的拒绝理由必须指出正路是 mcp__web-search-safe__web_search（现在是：${reason}）`);
+    } catch (error) { failures++; console.error(`FAIL ${error.message}`); }
+  }
   console.log(`${preset}: 放行项/拒绝项核对通过（手机工具${phoneAllowed ? '已放行' : '已拒绝'}）`);
 }
 // ── state/ 权限收紧（Windows 上 mode 0o600 是空操作，必须动 ACL）的离线守卫 ──────────

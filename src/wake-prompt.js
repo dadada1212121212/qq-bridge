@@ -331,9 +331,11 @@ export function createWakePrompt(S) {
     // [patch 工具范围 2026-10-18] 模型会去调「它以为存在」的工具：`mcp__snowluma2__*`（第二个号已停用）
     // 与 `compress`（被 preset 白名单遮掉），生产日志里这两类合计被拒 25 次、工具成功率被拉到 88.6%。
     // 光靠「不在清单里」不够——它看不见清单，只能靠提示词明确告知。这段是常量，进静态段吃缓存。
+    // [patch 2026-10-19] 又抓到一次真的 `tool=pwsh`（harness 日志的审批事件）：本机工具是 own 层，
+    // 注册期遮不掉、每轮都在 schema 里，泛泛说「shell / 文件类」它认不出来，必须点名。
     const toolScopeLine = '【工具范围】只有这些能用：mcp__snowluma__*（主号 QQ 工具）、web_search / web_fetch、'
-      + 'qq_memory_* 等状态工具。⛔ mcp__snowluma2__*（第二个号已停用）、compress、shell / 文件 / 浏览器类工具'
-      + '一律不可用，调了必被拒、白烧一轮 token。想压缩上下文就 qq_set_wake_config 收尾，别找 compress。\n\n';
+      + 'qq_memory_* 等状态工具。⛔ mcp__snowluma2__*（第二个号已停用）、compress、pwsh / bash / read / write / '
+      + 'edit / glob / grep 等本机工具一律不存在，调了必被拒、白烧一轮 token。想压缩上下文就 qq_set_wake_config 收尾，别找 compress。\n\n';
     const staticSeg = cardLine + roleLine + personaLine + antiAiLine + countLine
       + proactiveLine + memeLine + accountLine + tokenLine + toolScopeLine + searchLine + preSleepLine + contextLine + stepCostHint;
     const slimStaticSeg = cardLine + roleLine + personaLine + antiAiLine + countLine
@@ -485,7 +487,7 @@ export function createWakePrompt(S) {
       + `key 形如 group:数字 / private:数字，令牌是 48 位十六进制。别背别猜，照抄上面两行）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     // [patch 工具范围] 收尾提醒也带一句：这时最容易「随手调个不存在的工具」把回合拖死。
-    const toolScopeShort = '【工具】只有 mcp__snowluma__* 可用；mcp__snowluma2__* / compress / shell 一律被拒，别再试。\n\n';
+    const toolScopeShort = '【工具】只有 mcp__snowluma__* 可用；mcp__snowluma2__* / compress / pwsh / read / write 一律被拒，别再试。\n\n';
     return `${roleLine}${tokenLine}${toolScopeShort}${moodLineV2()}${usageLineV2(key)}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：想潜水直接 qq_set_wake_config 即可，不需要再等观察窗口。`;
   }
 

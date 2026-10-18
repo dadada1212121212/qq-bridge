@@ -441,3 +441,50 @@ test('注册期掩码的名单 = restrict() 会接受的名字（≠ 真能遮�
   const deny = new Set(mod.denyNamesFor({ allowPhoneAdb: false }));
   for (const name of strict) assert.ok(deny.has(name), `${name} 在可遮集合里却不在 deny 名单里（永远不会下发）`);
 });
+
+// ---------------------------------------------------------------------------
+// 2026-10-19：拒绝理由的「分类名单」必须五类不重、且并集覆盖整份 deny 名单。
+//
+// 起因是一次真实的 `tool=pwsh` 调用被拒（harness 日志里的审批事件）：本机工具是
+// own 层、注册期遮不掉，每轮都列在 schema 里，模型隔阵就想"跑个命令看看"。此前它
+// 只拿到一句泛泛的「不在白名单内」，容易理解成"我名字写错了"然后换个写法重试，
+// 白烧 token。所以守卫按工具类别给专门的拒绝理由（和 CONTEXT_TOOLS 同构）。
+//
+// 这条断言防的是**名单漂移**：LOCAL 类是从 RESTRICTED_TOOL_NAMES 扣掉另外四类算出来的，
+// 不是手抄的第二份。一旦有人往 RESTRICTED_TOOL_NAMES 加名字而忘了分类，或让两个集合
+// 重叠（同一个名字拿到两种自相矛盾的拒绝理由），这里立刻红。
+test('拒绝理由分类：五类互不相交，且并集覆盖整份受限名单', async () => {
+  const canonicalPath = path.join(ROOT, 'plugins', 'qq-agent-presets', 'qq-tool-restrict.mjs');
+  const mod = await import(pathToFileURL(canonicalPath).href);
+  for (const key of ['RESTRICTED_TOOL_NAMES', 'CONTEXT_TOOL_NAMES', 'HOST_SEARCH_TOOL_MESSAGE_NAMES',
+    'LOCAL_TOOL_MESSAGE_NAMES']) {
+    assert.ok(Array.isArray(mod[key]) && mod[key].length > 0, `守卫必须导出非空数组 ${key}`);
+  }
+  const families = [
+    ['上下文压缩', mod.CONTEXT_TOOL_NAMES],
+    ['宿主检索', mod.HOST_SEARCH_TOOL_MESSAGE_NAMES],
+    ['桌面专用', mod.HARNESS_ONLY_TOOL_NAMES],
+    ['手机面', mod.STRICT_ONLY_TOOL_NAMES],
+    ['本机能力', mod.LOCAL_TOOL_MESSAGE_NAMES],
+  ];
+  // 1) 两两不相交：同一个名字不允许落在两类里（否则拒绝理由自相矛盾）。
+  for (let i = 0; i < families.length; i++) {
+    for (let j = i + 1; j < families.length; j++) {
+      const overlap = families[i][1].filter((n) => families[j][1].includes(n));
+      assert.deepEqual(overlap, [], `「${families[i][0]}」与「${families[j][0]}」重叠：${overlap.join(', ')}`);
+    }
+  }
+  // 2) 不重不漏：并集必须正好等于 RESTRICTED_TOOL_NAMES（既不许漏——漏了就退回那句
+  //    泛泛的「不在白名单内」；也不许多——多了就是没人用的死条目）。
+  const union = new Set(families.flatMap(([, names]) => names));
+  const missing = mod.RESTRICTED_TOOL_NAMES.filter((n) => !union.has(n));
+  assert.deepEqual(missing, [], `这些受限工具没有任何一类拒绝理由：${missing.join(', ')}`);
+  // 3) 最常被模型惦记的几个名字必须落在「本机能力」类里（这次 bug 的主角）。
+  for (const name of ['pwsh', 'bash', 'read', 'write', 'edit', 'glob', 'grep', 'run_code', 'subagent']) {
+    assert.ok(mod.LOCAL_TOOL_MESSAGE_NAMES.includes(name), `${name} 应归入「本机能力」拒绝理由`);
+  }
+  // 4) 宿主检索必须指出正路，别让它以为"搜索功能整个没了"。
+  for (const name of ['web_search', 'web_fetch', 'advanced_search']) {
+    assert.ok(mod.HOST_SEARCH_TOOL_MESSAGE_NAMES.includes(name), `${name} 应归入「宿主检索」拒绝理由`);
+  }
+});
