@@ -1,5 +1,31 @@
 # QQ ↔ DeepSeek Harness Bridge (qq-bridge)
 
+> ### 📌 About this repository
+>
+> **This repository is an optimized fork of [`Derpyu520/qq-bridge`](https://github.com/Derpyu520/qq-bridge) (unofficial).**
+> The protocol adaptation, overall architecture and the original documentation come from the upstream author.
+> This fork adds substantial functionality, bug fixes and security hardening on top of it.
+> Looking for the original? Go upstream. Issues and PRs for the changes made here belong in this repository.
+
+<details>
+<summary><b>What this fork adds (click to expand)</b></summary>
+
+- **Long-term memory** (`src/memory-db.js`): facts / events / impressions / mood / topics, isolated per conversation
+- **Proactive behaviours**: due reminders, scheduled broadcasts, group recaps, private diary entries (dedicated 60s watchdog)
+- **Rewritten web search** (`src/web-search-lib.js`): concurrent sources, LRU cache, short timeouts, silent degradation
+- **Group features**: concurrent turns, mention claiming, mini-games, music requests, sticker/GIF pipeline
+- **Phone control**: direct adb (`phone-adb` MCP) plus a built-in `phone_lan` channel, owner DM only
+- **`botctl/`**: a phone-friendly control panel (port 3111) to start/stop the bridge and switch modes
+- **Richer local console**: `public/admin.html`, usage & cost panels, tool-call logs
+- **Session rotation with a token grace window** (6 retired generations per conversation, 60 minutes) — fixes bursts of "agent token invalid"
+- **Turn-tail handling**: the ~27s the kernel spends after `step/end` no longer blocks session rotation
+- **Peak-hour quiet mode** (`socialV2.peakQuiet`): no tokens burned in groups during peak pricing, one courtesy reply when mentioned
+- **Hardened tool allowlist** per preset, fail-closed console token, tighter `state/` permissions
+- **60+ regression scripts**; run the full audit with `npm run test:audit`
+
+</details>
+
+
 > Connect QQ messages to DeepSeek Harness (DSH) agents: QQ friends/groups become DSH conversations, and agent replies (including questions and tool approvals) are sent back to QQ.
 
 > ⚠️ **Current release `v0.2.0`, targets DSH 0.2.0-rc.2** (verified item by item on that version; run `npm run verify:adaptation`). It uses the persistent local signing key to **mint the session Cookie offline**, slash RPC endpoints and the `/api/remote.mux` event stream — a protocol generation introduced in DSH `0.1.2-alpha.1`, incompatible with the older dot-endpoint protocol. Reading the launch token out of the old guard logs has not worked since DSH 0.1.7 (the token is generated per process and never written to disk). Agent presets are `@deepseek-ai/dsh-agent-preset` Cordis rows since DSH 0.1.7 (the `~/.dsh/.agent-presets/` directory mechanism is gone). On **DSH `0.1.1-rc.2` or earlier**, use tag [`v0.1.0`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.0); for **DSH 0.1.5-rc.1** use [`v0.1.5`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.5); for **DSH 0.1.7-rc.2** use [`v0.1.7`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.7).

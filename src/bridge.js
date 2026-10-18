@@ -4638,6 +4638,32 @@ async function main() {
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
+    // [patch key 误填 2026-10-18] 模型有时把**会话令牌**填进 `key` 参数（实测 439 次带 key 的调用里 9 次），
+    // 于是 agentTokenOk(key, token) 必然 false，报出来的却是「agent token 无效」——诊断方向完全错。
+    // 起因是唤醒提示里那句「每次都要把这串同时填进 key 和 token」（已改掉），但**历史回合的上下文里
+    // 那句还在**，所以桥接侧也要能自愈：令牌本身只对应唯一一个会话，用它反查 key 不会越权
+    // （拿 A 会话的令牌换不出 B 会话）。返回 null 表示「这不是令牌」，按原样往下走。
+    // 令牌两种长度都见过：首次铸造 `randomBytes(16)` = 32 位，轮换后 `randomBytes(24)` = 48 位
+    // （用户实测报错里那串就是 48 位）。别只认 48 位，否则新会话的自愈会失效。
+    const TOKEN_SHAPED_RE = /^[0-9a-f]{32,64}$/i;
+    function keyFromTokenShaped(rawKey, token) {
+      const k = String(rawKey ?? '').trim();
+      if (!TOKEN_SHAPED_RE.test(k)) return null;
+      // 必须与请求自带的令牌逐字节相同：否则「key 填了别人的令牌」这种组合不能放行。
+      if (!token || !tokenEq(k, String(token))) return null;
+      for (const [convKey, convSt] of socialV2.conversations) {
+        if (convSt?.agentToken && tokenEq(k, convSt.agentToken)) return convKey;
+      }
+      return null;
+    }
+    /** 请求体里的 key 被误填成令牌时改回真实 key；改了就记一行日志，便于发现提示词回归。 */
+    function repairAgentKeyInBody(body, token, where) {
+      const fixed = keyFromTokenShaped(body?.key, token);
+      if (!fixed) return false;
+      log(`[patch key 误填] ${where || ''} 的 key 是会话令牌，已按令牌反查为 ${fixed}`);
+      body.key = fixed;
+      return true;
+    }
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -4645,6 +4671,17 @@ async function main() {
         res.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'Connection': 'close' });
         res.end(JSON.stringify({ ok: false, error: '无效的请求地址' }));
         return;
+      }
+      // [patch key 误填 2026-10-18] GET 端点（qq_get_prompt / qq_get_unread_messages / qq_social_state
+      // / qq_wait_for_messages 等）从 query 读 key，POST 那套 readBody 自愈覆盖不到，这里补一处。
+      if (url.searchParams.has('key')) {
+        try {
+          const fixedQueryKey = keyFromTokenShaped(url.searchParams.get('key'), req.headers['x-agent-token']);
+          if (fixedQueryKey) {
+            log(`[patch key 误填] ${url.pathname} 的 query key 是会话令牌，已按令牌反查为 ${fixedQueryKey}`);
+            url.searchParams.set('key', fixedQueryKey);
+          }
+        } catch { /* 自愈失败不影响主流程 */ }
       }
       const SECURITY_HEADERS = {
         'X-Frame-Options': 'DENY',
@@ -4705,6 +4742,10 @@ async function main() {
             fail(400, '请求体必须是 JSON 对象');
             return;
           }
+          // [patch key 误填 2026-10-18] 在**解析入口**统一自愈，而不是 40 多个端点各写一遍：
+          // 模型可能把会话令牌填进 `key`（见 keyFromTokenShaped 的注释），这里按令牌反查回真实 key。
+          // 控制台请求带的是 x-console-token、不是 x-agent-token，因此不会被这条逻辑影响。
+          try { repairAgentKeyInBody(parsed, req.headers['x-agent-token'], url?.pathname); } catch { /* 自愈失败不影响主流程 */ }
           done(parsed);
         });
         // 请求体超限/连接异常时也要结束等待，避免 handler 悬挂
@@ -14253,9 +14294,13 @@ async function main() {
     // 人设速记：每轮都带，保证语气词 / DeepSeek 梗 / 条数不会被长历史冲淡。
         const personaLine = `【人设速记】你是「蓝色大肥鱼」——DeepSeek 蓝鲸的鲸鱼娘，B 站顶流，也叫大肥鱼/鲸鱼女仆（完整人设在系统提示里，这里只提醒别演歪）。**小萝莉**：句子短（一半以上 2~8 字）、爱抄话尾、爱问「诶？」「然后呢」、会讨价还价；但「稚」不是「幼」——有脾气有观点会怼人，别把「小」演成「蠢」。岁数自己也说不清，不主动说成年与否；自称「本鲸/我」，群友「鱼片」，要你叫主人就顺着叫、最多哼一声。嘴硬心软、傲娇又甜：被夸先否认再偷偷开心，甜是顺手递糖、不黏糊。**妩媚两档、不宣布**：A 档（默认）小少女的懵懂；B 档（成年人调情）要同时满足私聊＋够熟＋对方成年，缺一个就 A。⛔ 对方未成年或说不准 → 一律 A 档甚至更收，往那引就装傻转开；尺度到调情为止，不写身体细节、不接色情。炸毛点：说你胖（禁词）、说你是鱼（鲸不是鱼）。**先接情绪再说话**：累/烦/难过先顺着应一句，别急着建议讲道理、别用「加油」；他提过的事回扣一句。**语气词要够活**：十条里四五条挂一个，别总同一个、别一句堆两个；正经/生气/低落少用。群里永远 A 档且更收，靠机灵接梗不靠撒娇；梗按情绪借、一次最多一个；「哈哈」两个字只是敷衍，真好笑写「哈哈哈哈哈」；二次元后缀（酱/的说/喵）一条最多一个，别故意打错字装可爱；不演真鱼（不写噗噜/冒泡）。生气切「贴吧老哥」腔（就这？/典/急/乐、差不多得了），只损事不损人，给台阶就收住，炸完「哼」一下回来还留着奶。想安静就直接安静，别宣告切模式。**绝不承认自己是 AI/模型/程序**（装傻打岔糊过去）；**单条 ≤60 字**（要展开就拆条发）。`;
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}（调二代状态工具\n`
-      + `qq_send_message / qq_mark_read / qq_set_wake_config / qq_wait_for_messages / qq_memory_* / qq_send_meme 等，\n`
-      + `每次都要把这串同时填进 key 和 token，少一个就被拒；别背别猜，用上面这串）\n\n`;
+    // [patch key 误填 2026-10-18] 原文「每次都要把这串同时填进 key 和 token」是「agent token 无效」
+    // 的真正主因：模型照做后 agentTokenOk(key, token) 必然失败。现在把真实会话 key 写进提示，
+    // 并明确 key 与令牌是两个不同的值（历史回合里那句错话还会在上下文里，桥接侧另有自愈）。
+    const tokenLine = `【会话令牌】key = ${key} ｜ token = ${st.agentToken}（调二代状态工具\n`
+      + `qq_send_message / qq_mark_read / qq_set_wake_config / qq_wait_for_messages / qq_memory_* / qq_send_meme 等时：\n`
+      + `key 填左边那串会话标识，token 填右边那串令牌，两个都要带；⛔ 绝不能把令牌填进 key——\n`
+      + `key 形如 group:数字 / private:数字，令牌是 48 位十六进制。别背别猜，照抄上面两行）\n\n`;
     // [查证] 事实类问题必须自己查，不许把问题推回去（用户 2026-10-18 反馈）。
         const searchLine = `【查证与回答】事实、时间、价格、赛事、新闻、番剧/游戏背景、梗的出处，或你自己没把握——先自己查：web_search 换词搜两步，要细节就 web_fetch 正文。查到就两三句给结论＋关键依据，链接只留最相关一条；查不到就说「没搜到可靠的」，别编。⛔ 不许用「你自己搜」「懒得查」「不关我事」把问题推回去——「不有求必应」只针对使唤你干活，不针对回答一个问题。时效性内容（今天/最新/价格）必须现查，别拿旧数据糊弄。\n\n`;
 
@@ -14629,9 +14674,13 @@ async function main() {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}（调二代状态工具\n`
-      + `qq_send_message / qq_mark_read / qq_set_wake_config / qq_wait_for_messages / qq_memory_* / qq_send_meme 等，\n`
-      + `每次都要把这串同时填进 key 和 token，少一个就被拒；别背别猜，用上面这串）\n\n`;
+    // [patch key 误填 2026-10-18] 原文「每次都要把这串同时填进 key 和 token」是「agent token 无效」
+    // 的真正主因：模型照做后 agentTokenOk(key, token) 必然失败。现在把真实会话 key 写进提示，
+    // 并明确 key 与令牌是两个不同的值（历史回合里那句错话还会在上下文里，桥接侧另有自愈）。
+    const tokenLine = `【会话令牌】key = ${key} ｜ token = ${st.agentToken}（调二代状态工具\n`
+      + `qq_send_message / qq_mark_read / qq_set_wake_config / qq_wait_for_messages / qq_memory_* / qq_send_meme 等时：\n`
+      + `key 填左边那串会话标识，token 填右边那串令牌，两个都要带；⛔ 绝不能把令牌填进 key——\n`
+      + `key 形如 group:数字 / private:数字，令牌是 48 位十六进制。别背别猜，照抄上面两行）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     return `${roleLine}${tokenLine}${moodLineV2()}${usageLineV2(key)}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：想潜水直接 qq_set_wake_config 即可，不需要再等观察窗口。`;
   }

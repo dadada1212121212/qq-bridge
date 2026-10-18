@@ -136,7 +136,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     appendMemoryV2, formatMemoryV2,
     startTurnGame, playTurnGame, renderTurnGame, buildMusicShare, renderMusicShare, saveSocialV2State,
-    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    buildWakePromptV2, buildWakeSnapshotV2, buildWakeReminderPromptV2, sendWakePromptV2, socialV2,
     broadcastCfgV2, broadcastKeyV2, buildBroadcastTaskV2, broadcastTickV2,
     groupRecapCfgV2, groupRecapTargetsV2, buildGroupRecapTaskV2, groupRecapTickV2,
     flushQueue, retireSession,
