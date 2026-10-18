@@ -78,6 +78,10 @@ npm start          # 或者双击 start.bat，崩溃会自动重启
 
 详细的配置、目录结构和排错方法在 [docs/](docs/)。
 
+## 已知限制
+
+- AI 发语音默认关闭，要在控制台里打开；不开也能自己发，图形界面是 `voice-gui.mjs`，命令行是 `voice-cli.mjs`
+
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。

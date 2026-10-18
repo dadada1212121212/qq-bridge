@@ -78,6 +78,10 @@ Once `SnowLuma 已连接` shows up in the log, send the bot a message on QQ to t
 
 Configuration, folder layout and troubleshooting are in [docs/](docs/).
 
+## Known limitations
+
+- Sending voice messages is off by default for the AI; turn it on in the console. Manual sending works either way: `voice-gui.mjs` for the GUI, `voice-cli.mjs` for the command line
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
