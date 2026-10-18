@@ -7,24 +7,12 @@
 > This fork adds substantial functionality, bug fixes and security hardening on top of it.
 > Looking for the original? Go upstream. Issues and PRs for the changes made here belong in this repository.
 
-<details>
-<summary><b>What this fork adds (click to expand)</b></summary>
-
-- **Long-term memory** (`src/memory-db.js`): facts / events / impressions / mood / topics, isolated per conversation
-- **Proactive behaviours**: due reminders, scheduled broadcasts, group recaps, private diary entries (dedicated 60s watchdog)
-- **Rewritten web search** (`src/web-search-lib.js`): concurrent sources, LRU cache, short timeouts, silent degradation
-- **Group features**: concurrent turns, mention claiming, mini-games, music requests, sticker/GIF pipeline
-- **Phone control**: direct adb (`phone-adb` MCP) plus a built-in `phone_lan` channel, owner DM only
-- **`botctl/`**: a phone-friendly control panel (port 3111) to start/stop the bridge and switch modes
-- **Richer local console**: `public/admin.html`, usage & cost panels, tool-call logs
-- **Session rotation with a token grace window** (6 retired generations per conversation, 60 minutes) — fixes bursts of "agent token invalid"
-- **Turn-tail handling**: the ~27s the kernel spends after `step/end` no longer blocks session rotation
-- **Peak-hour quiet mode** (`socialV2.peakQuiet`): no tokens burned in groups during peak pricing, one courtesy reply when mentioned
-- **Hardened tool allowlist** per preset, fail-closed console token, tighter `state/` permissions
-- **60+ regression scripts**; run the full audit with `npm run test:audit`
-
-</details>
-
+> **What this fork adds (in short)**
+>
+> - Richer long-term memory and proactive behaviour — conversations feel more continuous and human
+> - A lot of work on stability and running cost — happier to leave it running for days
+> - Security hardened, with more conservative defaults
+> - More tests and documentation, so problems are easier to pin down
 
 > Connect QQ messages to DeepSeek Harness (DSH) agents: QQ friends/groups become DSH conversations, and agent replies (including questions and tool approvals) are sent back to QQ.
 
