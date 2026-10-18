@@ -1729,7 +1729,17 @@ async function main() {
     }
     try {
       const count = Math.min(500, Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100));
-      const response = await bot.request('fetch_custom_face_detail', { count });
+      // [超时护栏] SnowLuma 偶尔会卡住不回：同步只给 3 秒，超时就当这轮同步失败，
+      // 用旧表情库继续（提示词里少几个表情无所谓，工具卡死 30 秒才是真事故）。
+      const syncTimeoutMs = Math.max(500, Number(cfg.socialV2?.sticker?.syncTimeoutMs) || 3000);
+      let syncTimer = null;
+      const response = await Promise.race([
+        bot.request('fetch_custom_face_detail', { count }),
+        new Promise((_, reject) => {
+          syncTimer = setTimeout(() => reject(new Error(`fetch_custom_face_detail 超时（${syncTimeoutMs}ms），本轮跳过同步`)), syncTimeoutMs);
+          if (typeof syncTimer.unref === 'function') syncTimer.unref();
+        }),
+      ]).finally(() => { if (syncTimer) clearTimeout(syncTimer); });
       if (!response || response.status !== 'ok' || response.retcode !== 0) {
         throw new Error(`fetch_custom_face_detail 失败: ${response?.wording || response?.retcode || 'unknown'}`);
       }
