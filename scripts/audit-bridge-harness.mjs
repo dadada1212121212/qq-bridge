@@ -32,6 +32,7 @@ import * as memoryDb from '../src/memory-db.js';
 import * as consoleServer from '../src/console-server.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as wakePromptLib from '../src/wake-prompt.js';
+import * as socialStateLib from '../src/social-state.js';
 import * as roleCard from '../src/role-card.js';
 import * as snowlumaConn from '../src/snowluma-conn.js';
 import * as broadcastLib from '../src/broadcast-lib.js';
@@ -185,6 +186,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     ...consoleServer,
     ...presetPrompt,
     ...wakePromptLib,
+    ...socialStateLib,
     ...roleCard,
     ...snowlumaConn,
     ...broadcastLib,

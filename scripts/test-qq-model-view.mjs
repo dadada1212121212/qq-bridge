@@ -240,7 +240,13 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
       const resolved = path.resolve(fixture);
       assert.equal(path.dirname(resolved), ROOT);
       assert.ok(path.basename(resolved).startsWith('.tmp-model-view-test-'));
-      await fs.rm(resolved, { recursive: true, force: true });
+      // 清理失败不该判定为回归：本机（以及 CI 沙箱）的 rm 可能被「安全删除/回收站」
+      // 包装拦截，偶发 ETIMEDOUT。目录名已限定在 ROOT 下且带固定前缀，留着无害。
+      try {
+        await fs.rm(resolved, { recursive: true, force: true });
+      } catch (error) {
+        console.warn(`[warn] 临时目录清理失败（不影响断言）：${resolved} — ${error?.message || error}`);
+      }
     }
   }
 });
