@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
-const bridge = read('src/bridge.js');
+const bridge = read('src/bridge.js') + '\n' + read('src/wake-prompt.js');
 const memdb = read('src/memory-db.js');
 const config = JSON.parse(read('config.json'));
 const example = JSON.parse(read('config.example.json'));

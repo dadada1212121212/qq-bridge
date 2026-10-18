@@ -14,7 +14,7 @@ import * as memeLib from '../src/meme-lib.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
-const bridge = read('src/bridge.js');
+const bridge = read('src/bridge.js') + '\n' + read('src/wake-prompt.js');
 
 let pass = 0;
 let fail = 0;
@@ -83,7 +83,7 @@ const mk = (id, desc, tags, useCount = 0) => ({ id, desc, localNote: '', tags, u
   ok(bridge.includes('detectMoodsFromText'), 'bridge 引入了 detectMoodsFromText');
   ok(read('src/meme-lib.js').includes('export function detectMoodsFromText'), 'meme-lib 导出了 detectMoodsFromText');
   ok(/stickerCfg\.contextAware === false/.test(bridge), '语境配图可单独关（sticker.contextAware）');
-  ok(/buildStickerContext\(stickerEntries, [^,]+, \{ moods: stickerMoods \}\)/.test(bridge), '调用时把推断的情绪传给了 buildStickerContext');
+  ok(/buildStickerContext\((?:S\.)?stickerEntries, [^,]+, \{ moods: stickerMoods \}\)/.test(bridge), '调用时把推断的情绪传给了 buildStickerContext');
   ok(/slice\(-6\)/.test(bridge.slice(bridge.indexOf('stickerMoods'), bridge.indexOf('stickerMoods') + 900)), '只看最近几条消息（不翻全部历史）');
   ok(/\.filter\(\(m\) => m && !m\.isSelf\)/.test(bridge.slice(bridge.indexOf('stickerMoods'), bridge.indexOf('stickerMoods') + 900)), '只从别人说的话里推断情绪（不把自己的话算进去）');
 
