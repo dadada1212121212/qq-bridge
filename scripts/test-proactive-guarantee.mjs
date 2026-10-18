@@ -17,7 +17,8 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const SRC = fs.readFileSync(path.join(root, 'src', 'bridge.js'), 'utf8');
+const SRC = fs.readFileSync(path.join(root, 'src', 'bridge.js'), 'utf8')
+  + '\n' + fs.readFileSync(path.join(root, 'src', 'console-server.js'), 'utf8');
 const LINES = SRC.split('\n').map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
 const countLines = (needle) => LINES.filter((l) => l.includes(needle)).length;
 const lineWith = (needle) => {

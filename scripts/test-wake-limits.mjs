@@ -15,7 +15,8 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const SRC = fs.readFileSync(path.join(root, 'src', 'bridge.js'), 'utf8');
+const SRC = fs.readFileSync(path.join(root, 'src', 'bridge.js'), 'utf8')
+  + '\n' + fs.readFileSync(path.join(root, 'src', 'console-server.js'), 'utf8');
 const LINES = SRC.split(/\r?\n/);
 const lineWith = (needle) => {
   const hit = LINES.filter((l) => l.includes(needle));

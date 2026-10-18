@@ -26,7 +26,7 @@ function ok(cond, name) {
   else { fail += 1; console.error(`  ❌ ${name}`); }
 }
 
-const bridgeSrc = read('src/bridge.js');
+const bridgeSrc = read('src/bridge.js') + '\n' + read('src/console-server.js');
 const cfg = JSON.parse(read('config.json'));
 const example = JSON.parse(read('config.example.json'));
 

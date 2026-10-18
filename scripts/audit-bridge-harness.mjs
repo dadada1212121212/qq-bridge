@@ -29,6 +29,10 @@ import * as groupTools from '../src/group-tools.js';
 import * as groupConcurrency from '../src/group-concurrency.js';
 import * as grumpMode from '../src/grump-mode.js';
 import * as memoryDb from '../src/memory-db.js';
+import * as consoleServer from '../src/console-server.js';
+import * as presetPrompt from '../src/preset-prompt.js';
+import * as roleCard from '../src/role-card.js';
+import * as snowlumaConn from '../src/snowluma-conn.js';
 import * as broadcastLib from '../src/broadcast-lib.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -177,6 +181,10 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     ...groupConcurrency,
     ...grumpMode,
     ...memoryDb,
+    ...consoleServer,
+    ...presetPrompt,
+    ...roleCard,
+    ...snowlumaConn,
     ...broadcastLib,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。

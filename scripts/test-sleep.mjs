@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
-const bridge = read('src/bridge.js');
+const bridge = read('src/bridge.js') + '\n' + read('src/console-server.js');
 const config = JSON.parse(read('config.json'));
 const example = JSON.parse(read('config.example.json'));
 const presetSrc = read('dsh/agent-presets/qq-chat-v2/agent.cordis.yml');

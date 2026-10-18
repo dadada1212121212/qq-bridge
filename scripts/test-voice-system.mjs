@@ -117,7 +117,7 @@ console.log('## 各入口 import 的符号都真实存在');
 
 console.log('## qq-bridge 语音系统：路由与开关');
 {
-  const bridge = read('src/bridge.js');
+  const bridge = read('src/bridge.js') + '\n' + read('src/console-server.js');
   for (const route of ["'/api/voice/send'", "'/api/send/voice'", "'/api/socialV2/send-voice'", "'/api/voice/list'", "'/api/socialV2/voices'"]) {
     ok(bridge.includes(route), `路由 ${route}`);
   }
@@ -141,7 +141,7 @@ console.log('## qq-bridge 语音系统：MCP 工具与开关映射');
   ok(mcp.includes("'qq_list_voices'"), '注册 qq_list_voices');
   ok(/qq_send_voice: 'sendVoice'/.test(mcp) && /qq_list_voices: 'sendVoice'/.test(mcp), '两个工具都受 sendVoice 开关控制');
   ok(/voice\?\.enabled !== false/.test(mcp), '注册期也检查 voice.enabled（关闭时不注册，省 token）');
-  const bridge = read('src/bridge.js');
+  const bridge = read('src/bridge.js') + '\n' + read('src/console-server.js');
   ok(/sendVoice: 'qq_send_voice \/ qq_list_voices'/.test(bridge), 'qq_get_prompt 的 toolMap 含语音工具');
   ok(/'sendVoice'\]/.test(bridge), 'config API 的 toolFlags 含 sendVoice');
   const ex = JSON.parse(read('config.example.json'));

@@ -134,7 +134,8 @@ console.log('## 配置项（AI 发语音默认关闭，等语音库准备好再�
   const ex = exCfg;
   ok(ex.socialV2?.voice?.dir === 'audio', 'config.example.json 含 voice 段');
   // 代码里的默认值也必须一致，否则删掉 config.json 里那两行就会变回"默认开"
-  const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8')
+  + '\n' + fs.readFileSync(path.join(ROOT, 'src', 'console-server.js'), 'utf8');
   ok(/sendVoice: false,/.test(bridgeSrc), 'bridge.js 里 tools 默认 sendVoice: false');
   ok(/cfg\.socialV2\.voice = \{\s*\n\s*enabled: false,/.test(bridgeSrc), 'bridge.js 里 voice 默认 enabled: false');
 }
@@ -150,7 +151,8 @@ console.log('## MCP 工具与 bridge 路由');
   ok(voiceBlock.includes('/api/socialV2/send-voice'), 'qq_send_voice 调 /api/socialV2/send-voice');
   ok(!voiceBlock.includes("绝对路径的音频"), 'qq_send_voice 不暴露绝对路径参数');
 
-  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8')
+  + '\n' + fs.readFileSync(path.join(ROOT, 'src', 'console-server.js'), 'utf8');
   for (const s of [
     '/api/voice/send', '/api/socialV2/send-voice', '/api/socialV2/voices',
     'sendVoiceV2', 'sendVoiceForV2', 'resolveVoicePathForV2', 'resolveVoicePathForOperator',
@@ -164,7 +166,8 @@ console.log('## MCP 工具与 bridge 路由');
 
 console.log('## 安全边界（AI 通道来源限制）');
 {
-  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8')
+  + '\n' + fs.readFileSync(path.join(ROOT, 'src', 'console-server.js'), 'utf8');
   const fn = bridge.slice(bridge.indexOf('function resolveVoicePathForV2'), bridge.indexOf('function resolveVoicePathForOperator'));
   ok(/base64:|data:|https\?:/.test(fn), 'AI 通道拒绝 base64/data/http 来源');
   ok(/allowAbsolutePath/.test(fn), 'AI 通道检查 allowAbsolutePath');
@@ -211,7 +214,8 @@ console.log('## preset 人设已描述语音能力（否则 AI 不知道自己�
 console.log('## 控制台契约');
 {
   const html = fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8');
-  const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8')
+  + '\n' + fs.readFileSync(path.join(ROOT, 'src', 'console-server.js'), 'utf8');
   ok(html.includes('data-v2-tool="sendVoice"'), '控制台有 sendVoice 工具开关');
   ok(bridgeSrc.includes("'sendVoice']"), 'config API 的 toolFlags 含 sendVoice');
   const uniq = (a) => [...new Set(a)].sort();
@@ -272,7 +276,8 @@ console.log('## 回归：长消息里的 URL 不许被切碎（P1，曾静默丢
   // 由来：splitLongSegment 用 \u0000URL<n>\u0000 占位符保护 URL，但对超长片段直接按
   // max 硬切，会拦腰切断占位符 → 还原正则失配 → URL 整条消失 + 裸 NUL + 字面量 "URL0"
   // 被发进 QQ 消息。这里把函数从 bridge.js 抽出来，对 1..max+20 所有长度做校验。
-  const src = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  const src = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8')
+  + '\n' + fs.readFileSync(path.join(ROOT, 'src', 'console-server.js'), 'utf8');
   const at = src.indexOf('function splitLongSegment');
   ok(at > 0, '在 bridge.js 里找到 splitLongSegment');
   if (at > 0) {
@@ -302,7 +307,8 @@ console.log('## 回归：AI 通道的语音库响应不许带出绝对路径（P
   // 由来：/api/socialV2/voices 的 dir 字段做了 agentCall ? undefined 抑制，
   // 但紧邻的 hint 模板字符串仍然无条件插值 ${voice.dir} —— 绝对路径又从旁边漏给模型了。
   // 这类"字段堵了、文案没堵"的漏法静态查最有效：AI 通道的所有响应字段与文案都不该含盘符/家目录。
-  const src = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  const src = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8')
+  + '\n' + fs.readFileSync(path.join(ROOT, 'src', 'console-server.js'), 'utf8');
   const at = src.indexOf("url.pathname === '/api/socialV2/voices'");
   ok(at > 0, '找到 voices 路由');
   const section = src.slice(at, at + 3200);
