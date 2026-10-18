@@ -28,6 +28,11 @@
 - **高峰静默**（`socialV2.peakQuiet`）：峰时群里不烧 token，被 @ 时替她说一句
 - **唤醒提示瘦身与三段式重排**：缓存命中率约 97%，单轮成本下降
 
+**代码结构**
+
+- `bridge.js` 从 1.8 万行拆成 4 个模块：`console-server.js`（控制台 HTTP 层）、`wake-prompt.js`（唤醒提示词构建）、`social-state.js`（社交状态机），主程序降到 1.2 万行
+- 新增 `test-module-wiring.mjs`：桥接用了某模块的导出就必须真的 `import` —— VM 夹具会把 import 剥掉改成注入，这类「漏接线」只会在生产启动时炸，普通测试看不见
+
 **安全**
 
 - 工具白名单按 preset 分流（`maskToAllowlist`），两套 QQ MCP 的别名收敛
@@ -36,7 +41,7 @@
 
 **测试**
 
-- `scripts/` 下 60+ 个回归脚本，`npm run test:audit` 一键跑全量审计
+- `scripts/` 下 84 个回归脚本（合计 2 万余行），`npm run test:audit` 一键跑 54 项全量审计
 
 </details>
 
@@ -292,7 +297,10 @@ qq-bridge/
   dsh/agent-presets/    # qq-chat / qq-chat-v2 的 DSH agent preset 模板
   plugins/qq-mode-console  # DSH 插件：注册 qq-mode 设置命名空间（仅 host 半，UI 卡片未实现）
   src/
-    bridge.js           # 主程序
+    bridge.js           # 主程序：回合调度、QQ 收发、MCP 注册（18099 → 12235 行）
+    console-server.js   # 控制台 HTTP 层：路由/鉴权/CSRF（从 bridge.js 拆出）
+    wake-prompt.js      # 唤醒提示词构建（从 bridge.js 拆出）
+    social-state.js     # 社交状态机：会话状态读盘/兜底/落盘（从 bridge.js 拆出）
     dsh-client.js       # Node 版 DSH API 客户端（WS 下行）
     md-to-plain.js      # Markdown → QQ 纯文本
     self-test.js        # DSH 侧自测
