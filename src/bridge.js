@@ -7130,6 +7130,93 @@ async function main() {
     return false;
   }
 
+  // ── [patch 活跃期选择性沉默（二代移植，2026-10-19 回答机制第 5 条）] ──────────
+  // 醒着 ≠ 每条都回。一代引擎（reserved）的 socialLoopTick 活跃分支有完整实现，
+  // 但线上跑的是 reserved2，那套循环在二代下是死代码 —— 在二代消息路径上重实现核心语义：
+  //   ① 活跃窗口 = 自己最后一次发言后 idleWindowMs（cfg.social.idleWindowMs，默认 6 分钟）内；
+  //   ② 必须回：引用自己 / 命中 mustReplyKeywords / 直接向 AI 提问 —— 不掷骰，直接投递；
+  //   ③ 普通闲聊按 skipProbability 掷骰沉默；刚发言 60 秒内不沉默；未读积压越多沉默率越低；
+  //   ④ 沉默 = 不唤醒：消息已留在 unread（二代所有消息都进 unread，见 appendSocialV2Message），
+  //      下次唤醒时随快照一并带给模型 —— 天然等价一代的 silentContext（"看到过但没接"）；
+  //   ⑤ 活跃期投递按 activeCheckMinMs 节流，消息风暴不逐条开回合（连发由 batchWindowMs 合并）。
+  function lastSelfSpeakAtV2(st) {
+    const recent = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
+    for (let i = recent.length - 1; i >= 0; i--) {
+      const m = recent[i];
+      if (m && m.isSelf && Number(m.time)) return Number(m.time);
+    }
+    return 0;
+  }
+
+  // 返回 true = 本条消息已在活跃期逻辑内处理（投递或沉默），调用方不再走常规唤醒；
+  // 返回 false = 不在活跃窗口，维持原判定结果（不醒）。
+  function maybeActivePeriodDeliveryV2(key, st, { sender, plainContent, quoteTargetIsSelf }) {
+    if (!key.startsWith('group:')) return false;
+    if (sleepStateV2(key, st).asleep) return false;
+    const now = Date.now();
+    const activeWindowMs = Math.max(60000, Number(cfg.social?.idleWindowMs ?? 360000));
+    const spokeAt = Math.max(Number(st.lastAiReplyAt) || 0, lastSelfSpeakAtV2(st));
+    if (!spokeAt || now - spokeAt >= activeWindowMs) return false;
+    const mustReply = quoteTargetIsSelf || isMustReplyText(plainContent);
+    if (!mustReply) {
+      let skipProb = Math.min(1, Math.max(0, Number(cfg.social?.skipProbability ?? 0.3)));
+      if (now - spokeAt < 60000) skipProb = 0; // 刚回复 60 秒内不沉默，避免"聊一半突然消失"
+      const backlog = Math.max(0, (Array.isArray(st.unread) ? st.unread.length : 1) - 1);
+      skipProb = Math.max(0, skipProb - Math.min(0.5, backlog * 0.1)); // 消息越多压力越大，沉默率越低
+      if (Math.random() < skipProb) {
+        log(`[reserved2] 活跃期 ${key} 选择性沉默（skip=${skipProb.toFixed(2)}）：不唤醒，${Array.isArray(st.unread) ? st.unread.length : 0} 条未读将随下次唤醒带给模型`);
+        appendActivity(`${key} [reserved2] 活跃期选择性沉默：${String(sender ?? '')} 的消息不接`);
+        return true;
+      }
+    }
+    const gapMin = Math.max(5000, Number(cfg.social?.activeCheckMinMs ?? 8000));
+    if (Number(st.lastActiveDeliverAt) && now - Number(st.lastActiveDeliverAt) < gapMin) {
+      log(`[reserved2] 活跃期 ${key} 投递节流（距上次 <${Math.round(gapMin / 1000)}s），消息留 unread 随下轮带出`);
+      return true;
+    }
+    st.lastActiveDeliverAt = now;
+    log(`[reserved2] 活跃期 ${key} 投递普通闲聊（anyMessage，${mustReply ? '必须回' : 'skip 未命中'}）`);
+    scheduleWakeV2(key, 'anyMessage');
+    return true;
+  }
+
+  // ── [patch 冷场试探（二代移植，回答机制第 5 条）] ─────────────────────────
+  // 活跃窗口刚过且群里没人说话（冷场）→ 按 idleRetryProbability（cfg.social，默认 0.4）
+  // 试探说一句，否则退回观望。只在群聊生效；每个"发言周期"至多排一次（下次发言后重排）。
+  // 复用 proactiveCheck 唤醒通道（提示词/闸门/优先级全套现成），只是触发条件从随机 tick
+  // 换成「冷场判定」。
+  const idleProbeTimersV2 = new Map();
+  function scheduleIdleProbeV2(key) {
+    if (!key.startsWith('group:')) return;
+    if (idleProbeTimersV2.has(key)) return; // 已有待发的试探：一个发言周期只排一次
+    const idleWindowMs = Math.max(60000, Number(cfg.social?.idleWindowMs ?? 360000));
+    const timer = setTimeout(() => {
+      idleProbeTimersV2.delete(key);
+      try {
+        const st = socialV2.conversations.get(key);
+        if (!st || currentMode !== 'reserved2' || socialV2.paused) return;
+        if (sleepStateV2(key, st).asleep) return;
+        const now = Date.now();
+        const spokeAt = Math.max(Number(st.lastAiReplyAt) || 0, lastSelfSpeakAtV2(st));
+        // 活跃窗口刚过（过久就别硬找话了，退回观望）；期间有人说话就不算冷场
+        if (!spokeAt || now - spokeAt < idleWindowMs || now - spokeAt > idleWindowMs * 3) return;
+        if ((Number(st.lastIncomingAt) || 0) > spokeAt) return;
+        if (isConversationBusyV2(key, st)) return;
+        const prob = Math.min(1, Math.max(0, Number(cfg.social?.idleRetryProbability ?? 0.4)));
+        if (Math.random() >= prob) {
+          log(`[reserved2] 冷场 ${key}：掷骰观望（prob=${prob}），本轮不开口`);
+          return;
+        }
+        log(`[reserved2] 冷场试探 ${key}：按 prob=${prob} 命中，开口探探群里还有人没`);
+        sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] 冷场试探异常 ${key}:`, error?.message ?? error));
+      } catch (error) {
+        log(`[reserved2] 冷场试探调度异常 ${key}:`, error?.message ?? error);
+      }
+    }, idleWindowMs + 30000);
+    timer.unref?.();
+    idleProbeTimersV2.set(key, timer);
+  }
+
   function appendRecentMessage(key, sender, textContent, plainText, quoteTargetIsSelf = false, isOwner = false, media = [], messageRef = '') {
     if (!social.recentMessages.has(key)) social.recentMessages.set(key, []);
     const arr = social.recentMessages.get(key);
@@ -8401,6 +8488,8 @@ async function main() {
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
+    // [patch 冷场试探] AI 实际发言 = 活跃窗口起点：窗口刚过且没人说话时按概率试探（群聊）。
+    scheduleIdleProbeV2(key);
     saveSocialV2State();
   }
 
@@ -10574,6 +10663,11 @@ async function main() {
       clearTimeout(peakTimer);
       peakResumeTimersV2.delete(key);
     }
+    const probeTimer = idleProbeTimersV2.get(key);
+    if (probeTimer) {
+      clearTimeout(probeTimer);
+      idleProbeTimersV2.delete(key);
+    }
     st.pendingWakeReason = null;
     if (st.deferredWakeTimer) {
       clearTimeout(st.deferredWakeTimer);
@@ -10871,6 +10965,9 @@ async function main() {
           } else {
             scheduleWakeV2(key, reason);
           }
+        } else if (maybeActivePeriodDeliveryV2(key, st, { sender, plainContent, quoteTargetIsSelf })) {
+          // [patch 活跃期选择性沉默] 触发链未命中但会话处于活跃窗口：
+          // 已在上面的助手内处理（投递 anyMessage / 掷骰沉默 / 节流），无需常规唤醒。
         }
       }
       appendActivity(`${key} [reserved2] 消息已入未读：${textContent.slice(0, 80)}`);
