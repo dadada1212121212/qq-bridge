@@ -89,4 +89,26 @@ server.tool(
   }
 );
 
+server.tool(
+  'bili_comments',
+  '只读拉取 B 站视频的热门评论：给 BV 号或链接，返回评论人、内容、点赞数。想聊「大家怎么看这个视频」时用。不执行任何本地操作，不替你发评论。',
+  {
+    video: z.string().describe('BV 号、av 号或 bilibili 视频链接'),
+    sort: z.enum(['hot', 'time']).optional().describe('排序：hot=最热（默认），time=最新'),
+    limit: z.number().int().min(1).max(15).optional().describe('要几条，默认 8')
+  },
+  async ({ video, sort, limit }) => {
+    try {
+      const r = await bili.comments(video, { sort: sort ?? 'hot', limit: limit ?? 8 });
+      const head = `【B 站·评论】${r.title || '视频 ' + r.aid}（共 ${r.total} 条）\n`;
+      const body = r.comments.length
+        ? r.comments.map((c, i) => `${i + 1}. ${c.user}（赞${c.like}）：${c.text}`).join('\n')
+        : '（这条视频还没有评论）';
+      return { content: [{ type: 'text', text: head + body }], isError: r.comments.length === 0 };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `拉评论失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
 await server.connect(new StdioServerTransport());

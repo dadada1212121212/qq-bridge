@@ -187,7 +187,39 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
     };
   }
 
-  return { search, videoInfo, popular, userInfo, _internal: { getBuvid3, getWbiKeys, biliGet } };
+  /** 视频评论区。input 支持 BV 号 / av 号 / 链接。sort: 'hot'=最热(默认) | 'time'=最新。只读。 */
+  async function comments(input, { sort = 'hot', limit = 8 } = {}) {
+    // 评论区接口 oid 用 aid：给的是 bvid 时用 view 接口换（实测 archive/stat 被 WAF 挡回 HTML 404，
+    // view 带同样的头是通的 —— 2026-10-19 真机验证）。
+    const id = parseVideoId(input);
+    if (!id) throw new Error('认不出视频标识：给 BV 号、av 号或 bilibili 视频链接');
+    let aid = id.aid;
+    let title = '';
+    if (!aid) {
+      const v = await biliGet(`/x/web-interface/view?bvid=${id.bvid}`);
+      aid = v?.aid;
+      title = stripEm(v?.title || '');
+    }
+    if (!aid) throw new Error('换 aid 失败：B 站接口没给出这个视频的 aid');
+    const sn = sort === 'time' ? 0 : 2; // 官方 sort：0=时间 2=热度（1=点赞，这里只暴露两档）
+    const d = await biliGet(`/x/v2/reply?type=1&oid=${aid}&pn=1&ps=20&sort=${sn}`);
+    const out = [];
+    for (const r of (Array.isArray(d?.replies) ? d.replies : [])) {
+      const text = stripEm(String(r?.content?.message || '')).replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      out.push({
+        user: stripEm(r?.member?.uname || '?'),
+        like: Number(r?.like) || 0,
+        ctime: Number(r?.ctime) || 0,
+        text: text.slice(0, 120),
+        replies: Number(r?.rcount) || 0
+      });
+      if (out.length >= Math.min(15, Math.max(1, limit))) break;
+    }
+    return { aid, title, comments: out, total: String(d?.page?.acount || d?.page?.count || '?') };
+  }
+
+  return { search, videoInfo, popular, userInfo, comments, _internal: { getBuvid3, getWbiKeys, biliGet } };
 }
 
 /** 去掉搜索结果标题里的 <em class="keyword"> 高亮标签。 */
