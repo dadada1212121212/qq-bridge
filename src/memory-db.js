@@ -1013,7 +1013,17 @@ export function createMemoryDb({ file, tokenUsageFile = '', log = () => {}, maxF
           .sort((a, b) => (b.score - a.score) || (b.at - a.at));
         const picked = ranked.slice(0, 10);
         lines.push('【你记着的事】');
-        for (const f of picked) lines.push('- ' + f.text);
+        // [省token 2026-10-19] 印象段总量预算 450 字、单条 90 字封顶：这段的定位是
+        // 「模糊印象，顺口提起就好」（见 return 头注释），细节留在库里用 qq_memory_* 现查。
+        // 以前单条不限长，一条 150 字的辩论摘要就吃掉预算的 1/3。
+        let memBudget = 450;
+        for (const f of picked) {
+          let t = String(f.text || '').replace(/\s+/g, ' ').trim();
+          if (t.length > 90) t = t.slice(0, 89) + '…';
+          if (memBudget - t.length < 0) break;
+          memBudget -= t.length;
+          lines.push('- ' + t);
+        }
       }
       const events = db.prepare('SELECT at, summary FROM events WHERE key = ? ORDER BY at DESC LIMIT 3').all(key);
       if (events.length) {

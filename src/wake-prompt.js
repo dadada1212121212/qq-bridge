@@ -98,10 +98,11 @@ export function createWakePrompt(S) {
     // [patch key 误填 2026-10-18] 原文「每次都要把这串同时填进 key 和 token」是「agent token 无效」
     // 的真正主因：模型照做后 agentTokenOk(key, token) 必然失败。现在把真实会话 key 写进提示，
     // 并明确 key 与令牌是两个不同的值（历史回合里那句错话还会在上下文里，桥接侧另有自愈）。
-    const tokenLine = `【会话令牌】key = ${key} ｜ token = ${st.agentToken}（调二代状态工具\n`
-      + `qq_send_message / qq_mark_read / qq_set_wake_config / qq_wait_for_messages / qq_memory_* / qq_send_meme 等时：\n`
-      + `key 填左边那串会话标识，token 填右边那串令牌，两个都要带；⛔ 绝不能把令牌填进 key——\n`
-      + `key 形如 group:数字 / private:数字，令牌是 48 位十六进制。别背别猜，照抄上面两行）\n\n`;
+    // [省token 2026-10-19] 说明从 4 行压到 2 行：桥接侧 query/body/填反三层自愈已兜底，
+    // 这里只保留「两个都带 + 令牌别填进 key」最关键的两句。
+    const tokenLine = `【会话令牌】key = ${key} ｜ token = ${st.agentToken}\n`
+      + `（调 qq_send_message / qq_set_wake_config / qq_memory_* 等二代状态工具时两个都必带；\n`
+      + `⛔ 令牌别填进 key——key 形如 group:数字 / private:数字，token 是 48 位十六进制，照抄别背）\n\n`;
     // [查证] 事实类问题必须自己查，不许把问题推回去（用户 2026-10-18 反馈）。
         const searchLine = `【查证与回答】事实、时间、价格、赛事、新闻、番剧/游戏背景、梗的出处，或你自己没把握——先自己查：web_search 换词搜两步，要细节就 web_fetch 正文。查到就两三句给结论＋关键依据，链接只留最相关一条；查不到就说「没搜到可靠的」，别编。⛔ 不许用「你自己搜」「懒得查」「不关我事」把问题推回去——「不有求必应」只针对使唤你干活，不针对回答一个问题。时效性内容（今天/最新/价格）必须现查，别拿旧数据糊弄。\n\n`;
 
@@ -516,10 +517,11 @@ export function createWakePrompt(S) {
     // [patch key 误填 2026-10-18] 原文「每次都要把这串同时填进 key 和 token」是「agent token 无效」
     // 的真正主因：模型照做后 agentTokenOk(key, token) 必然失败。现在把真实会话 key 写进提示，
     // 并明确 key 与令牌是两个不同的值（历史回合里那句错话还会在上下文里，桥接侧另有自愈）。
-    const tokenLine = `【会话令牌】key = ${key} ｜ token = ${st.agentToken}（调二代状态工具\n`
-      + `qq_send_message / qq_mark_read / qq_set_wake_config / qq_wait_for_messages / qq_memory_* / qq_send_meme 等时：\n`
-      + `key 填左边那串会话标识，token 填右边那串令牌，两个都要带；⛔ 绝不能把令牌填进 key——\n`
-      + `key 形如 group:数字 / private:数字，令牌是 48 位十六进制。别背别猜，照抄上面两行）\n\n`;
+    // [省token 2026-10-19] 说明从 4 行压到 2 行：桥接侧 query/body/填反三层自愈已兜底，
+    // 这里只保留「两个都带 + 令牌别填进 key」最关键的两句。
+    const tokenLine = `【会话令牌】key = ${key} ｜ token = ${st.agentToken}\n`
+      + `（调 qq_send_message / qq_set_wake_config / qq_memory_* 等二代状态工具时两个都必带；\n`
+      + `⛔ 令牌别填进 key——key 形如 group:数字 / private:数字，token 是 48 位十六进制，照抄别背）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     // [patch 工具范围] 收尾提醒也带一句：这时最容易「随手调个不存在的工具」把回合拖死。
     const toolScopeShort = '【工具】只有 mcp__snowluma__* 可用；mcp__snowluma2__* / compress / pwsh / read / write 一律被拒，别再试。\n\n';
