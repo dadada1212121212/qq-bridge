@@ -34,3 +34,43 @@ const MILESTONES = [7, 30, 100, 200, 300, 365, 500, 730, 1000, 1095, 1460, 1825,
 export function milestoneDays(days) {
   return MILESTONES.includes(Math.floor(days)) ? Math.floor(days) : 0;
 }
+
+// ── [养鱼·追更安利 2026-10-19] ────────────────────────────────────────────────
+// 纯规则：拿配置里的关注名单 + 上次见过的最新投稿，和这次抓到的投稿列表对账。
+// 放这里和事件跟进一个道理——规则要能脱离桥接单测，桥接只做接线。
+
+/**
+ * 对账一轮关注列表。
+ * @param {Array} follows 配置名单 [{ mid, name }]
+ * @param {Object} stateMap 会话里存的追更水位 { [mid]: { lastBvid, lastTitle, seeded } }
+ * @param {Map|Object} results mid → userVideos 结果（{mid,name,count:[{bvid,title,pubdate,url}]}）或 null（抓失败）
+ * @returns {{ updates: Array<{mid,name,video}>, state: Object, seeded: number }}
+ *   updates = 本次要安利的新投稿；state = 写回会话的新水位；seeded = 首次建档数量。
+ */
+export function diffBiliFollowsV2(follows, stateMap, results) {
+  const list = Array.isArray(follows) ? follows : [];
+  const state = (stateMap && typeof stateMap === 'object') ? { ...stateMap } : {};
+  const get = (mid) => (results instanceof Map ? results.get(mid) : results?.[String(mid)]) || null;
+  const updates = [];
+  let seeded = 0;
+  for (const f of list) {
+    const mid = String(f?.mid || '').trim();
+    if (!mid) continue;
+    const name = String(f.name || '').trim() || String(state[mid]?.name || '').trim();
+    const r = get(mid);
+    const newest = Array.isArray(r?.count) && r.count.length ? r.count[0] : null;
+    if (!newest?.bvid) continue; // 抓失败/没投稿：水位不动，下次再说
+    const prev = state[mid] || {};
+    if (!prev.seeded) {
+      // 首次建档只记水位不报更新——不然刚加关注就把人家半年的旧稿全安利一遍。
+      state[mid] = { name, lastBvid: newest.bvid, lastTitle: newest.title, lastPubdate: Number(newest.pubdate) || 0, seeded: true };
+      seeded++;
+      continue;
+    }
+    if (prev.lastBvid && newest.bvid !== prev.lastBvid) {
+      updates.push({ mid, name, video: newest });
+      state[mid] = { name, lastBvid: newest.bvid, lastTitle: newest.title, lastPubdate: Number(newest.pubdate) || 0, seeded: true };
+    }
+  }
+  return { updates, state, seeded };
+}

@@ -60,6 +60,7 @@ export function createWakePrompt(S) {
     replyTimingV2,
     reverse,
     selfStyleLineV2,
+    sleepToneLineV2,
     socialV2,
     usageLineV2,
   } = S;
@@ -311,6 +312,10 @@ export function createWakePrompt(S) {
       }
     } catch (e) { log('[暴躁] 判定失败：' + (e?.message || e)); }
     const moodLine = moodLineV2(reason, grumpSig);
+    // [作息·语气层 2026-10-19] 深夜困 / 刚被叫醒 / 早上刚睡醒——三个时刻的一句话。
+    // 放 volatileSeg：随时间变化，必须每轮重算；瘦身轮也保留（它直接决定这轮怎么说话）。
+    let sleepToneLine = '';
+    try { sleepToneLine = sleepToneLineV2(key); } catch (e) { log('[作息] 语气段生成失败：' + (e?.message || e)); }
     // [关系] 只注入「此刻在场的几个人」跟她的关系（好感/档位/称呼/约定/最近的共同回忆）。
     const relationLine = relationLineV2(key);
     // [B 口癖画像] 她自己说话的习惯（常用词 / 句尾 / 平均句长），从她真发过的话里统计。
@@ -376,7 +381,7 @@ export function createWakePrompt(S) {
     // [铁律] 每一轮都带一句：完整铁律在角色卡（qq_get_prompt 可查），这里只保证长会话/轮换后不会忘。
     const ironLine = '【铁律·最高】演真人，别承认是 AI；单条 ≤60 字；不用 emoji、不念稿；不服务不讨好、有自己的主见和情绪；少@人；不层层递进。\n\n';
     const slowSeg = moeLine + wakeLine + recapLine + dbLine + diaryLine + styleLine + ironLine;
-    const volatileSeg = moodLine + grumpLine + moodMemoryLine + moodBoardLine + relationLine + askLine + statusLine + usageLine + stickerContextLine
+    const volatileSeg = moodLine + grumpLine + sleepToneLine + moodMemoryLine + moodBoardLine + relationLine + askLine + statusLine + usageLine + stickerContextLine
       + memoryLine + participationLine + recallLine + longRecallLine
       + followUpLine + anniversaryLine + memorySelfCheckLine + coldShoulderLine + replyLine;
     // [省token] 瘦身模式：补答回合 / 群聊正热时只留「人设 + 规则 + 台账 + 状态 + 收尾」，
@@ -386,7 +391,7 @@ export function createWakePrompt(S) {
     // 你记着的事 / 对群友的印象】—— 一共 ≈650 字，砍掉换来的钱很少，但她在群里会当场
     // 变成记不住人的陌生人。回放/关系/口癖/动漫库/表情清单/参与感/用量/账号仍然照砍。
     const slimKeepMemory = asksCfgV2().slimKeepMemory !== false;
-    const slimSeg = standingLine + (lean ? '' : slimStaticSeg) + askLine + grumpLine + moodLine + moodBoardLine + statusLine
+    const slimSeg = standingLine + (lean ? '' : slimStaticSeg) + askLine + grumpLine + moodLine + sleepToneLine + moodBoardLine + statusLine
       + (slimKeepMemory ? memoryLine : '')
       // [拟人] 瘦身轮也必须带的四件套里的两段：直接决定这轮怎么回人（该问的问、别扭的淡着）。
       + followUpLine + coldShoulderLine;
@@ -408,6 +413,7 @@ export function createWakePrompt(S) {
           styleLine,
           participationLine, recallLine, longRecallLine, replyLine,
           followUpLine, anniversaryLine, memorySelfCheckLine, coldShoulderLine,
+          sleepToneLine,
         };
         const rows = Object.entries(parts)
           .filter(([, v]) => typeof v === 'string' && v.length > 0)
@@ -504,6 +510,19 @@ export function createWakePrompt(S) {
     // [养鱼] 每日巡园：以肥鱼号在 B 站活动一次，再向主人汇报。
     if (reason === 'biliStroll') {
       return `${base}【B 站巡园】${key}\n原因：每天一次的养号日常，这是发给主人的私聊，最后记得跟他讲你干了什么。\n流程：① bili_hot 看看当前热门，或 bili_user_videos 看看关注的 UP 有没有更新；② 挑一个你**真觉得有意思**的视频（bili_video 看详情、bili_comments 看评论找梗）；③ 用你的口吻 bili_post_comment 发一条评论（顺眼就顺手 bili_like 点个赞，特别戳就 bili_coin）；④ 一两句话跟主人汇报：逛了什么、评了什么、为什么选它。\n⚠️ 频控是硬的（评论 5/天、同视频只动一次）：报「额度已用完」就别再试，报「cookie 失效」就照实让主人重新导。发言像平时说话，别引战别辱骂。`;
+    }
+    // [养鱼·追更] 关注的 UP 主更新了，主动来安利。
+    if (reason === 'biliFollow') {
+      const pf = S.socialV2?.pendingBiliFollow;
+      const mine = pf && pf.key === key && Array.isArray(pf.items) ? pf.items : [];
+      const isGroup = String(key).startsWith('group:');
+      const detail = mine.length
+        ? mine.map((u) => `· ${u.name}：《${u.video.title}》 ${u.video.url}`).join('\n')
+        : '·（素材暂存丢了，就凭 bili_user_videos 现查你关注的 UP）';
+      const action = isGroup
+        ? '像平时聊天那样，自然地把这个更新安利给大家（「我关注的 XX 更新了」的感觉），别像广告、别刷屏，一两句话带个链接就好。'
+        : '跟主人随口聊一句你关注的 UP 更新了、你想不想看，别像汇报工作。';
+      return `${base}【追更安利】${key}\n原因：你关注的 UP 主有新投稿了，你想跟大家/主人说一声。更新的内容：\n${detail}\n${action}想看就先用 bili_video 看一眼再说话（像看过再推荐的人）；特别戳你还可以 bili_post_comment 去评论区说一句（频控是硬的，报错就别试）。说完照常 qq_set_wake_config 收尾。`;
     }
     // [省token 2026-10-18] 原唤醒尾巴 454 字（含【行动前】四连问 + 群/私两套话术 + 一整段引用规则
     // + 「你可以调用工具查看未读消息…」），其中引用规则与 qq_send_message 的工具说明逐字重复，

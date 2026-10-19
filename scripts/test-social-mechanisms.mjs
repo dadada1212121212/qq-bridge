@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays } from '../src/social-mechanisms.js';
+import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays, diffBiliFollowsV2 } from '../src/social-mechanisms.js';
 import { createLongMemory } from '../src/long-memory.js';
 
 let passed = 0;
@@ -93,5 +93,43 @@ ok('sampleEpisode：会话隔离（别的 key 抽不到）', () => {
 
 try { lm.close(); } catch { /* */ }
 try { unlinkSync(tmpDb); } catch { /* */ }
+
+// ── [养鱼·追更] diffBiliFollowsV2 判新规则 ────────────────────────────────────
+const VIDEO_A = { bvid: 'BV1AbCdEfGh1', title: '旧稿', pubdate: 1760000000, url: 'u1' };
+const VIDEO_B = { bvid: 'BV1XyZwVuTs2', title: '新稿', pubdate: 1760800000, url: 'u2' };
+const FOLLOWS = [{ mid: '12345', name: '老番茄' }, { mid: '67890', name: '影视飓风' }, { name: '没给mid的忽略' }];
+ok('diffBiliFollows：首次建档只记水位不报更新（避免把旧稿全安利一遍）', () => {
+  const r = diffBiliFollowsV2(FOLLOWS, {}, new Map([['12345', { mid: '12345', name: '老番茄', count: [VIDEO_A] }]]));
+  assert.equal(r.updates.length, 0);
+  assert.equal(r.seeded, 1);
+  assert.equal(r.state['12345'].lastBvid, VIDEO_A.bvid);
+  assert.equal(r.state['12345'].seeded, true);
+});
+ok('diffBiliFollows：换了新 bvid 才报更新，水位跟着走', () => {
+  const prev = { '12345': { name: '老番茄', lastBvid: VIDEO_A.bvid, lastTitle: '旧稿', seeded: true } };
+  const r1 = diffBiliFollowsV2(FOLLOWS, prev, new Map([['12345', { count: [VIDEO_A] }]]));
+  assert.equal(r1.updates.length, 0, '同一投稿不算新');
+  const r2 = diffBiliFollowsV2(FOLLOWS, prev, new Map([['12345', { count: [VIDEO_B] }]]));
+  assert.equal(r2.updates.length, 1);
+  assert.equal(r2.updates[0].name, '老番茄');
+  assert.equal(r2.updates[0].video.bvid, VIDEO_B.bvid);
+  assert.equal(r2.state['12345'].lastBvid, VIDEO_B.bvid);
+});
+ok('diffBiliFollows：抓失败的 UP 水位不动、不影响别人', () => {
+  const prev = { '12345': { name: '老番茄', lastBvid: VIDEO_A.bvid, seeded: true } };
+  const results = new Map([['12345', null], ['67890', { count: [VIDEO_A] }]]);
+  const r = diffBiliFollowsV2(FOLLOWS, prev, results);
+  assert.equal(r.updates.length, 0, '67890 首次见是建档不算更新');
+  assert.equal(r.state['12345'].lastBvid, VIDEO_A.bvid, '抓失败的水位原样');
+  assert.equal(r.state['67890'].seeded, true);
+});
+ok('diffBiliFollows：名单里的脏条目（没 mid）被跳过', () => {
+  const r = diffBiliFollowsV2(FOLLOWS, {}, new Map());
+  assert.equal(Object.keys(r.state).length, 0);
+});
+ok('diffBiliFollows：results 传普通对象也行', () => {
+  const r = diffBiliFollowsV2([{ mid: '12345', name: 'x' }], {}, { 12345: { count: [VIDEO_A] } });
+  assert.equal(r.seeded, 1);
+});
 
 console.log(`test-social-mechanisms: ${passed} 断言通过${process.exitCode ? '（存在失败）' : ''}`);

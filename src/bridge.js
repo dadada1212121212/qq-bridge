@@ -48,7 +48,8 @@ import { createLongMemory, localDayString } from './long-memory.js';
 import { createConsoleServer } from './console-server.js';
 import { createWakePrompt } from './wake-prompt.js';
 import { createSocialState } from './social-state.js';
-import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays } from './social-mechanisms.js';
+import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays, diffBiliFollowsV2 } from './social-mechanisms.js';
+import { createBili } from './bilibili-lib.js';
 import {
   loadSlang,
   saveSlang,
@@ -7016,6 +7017,40 @@ async function main() {
     }
   }
 
+  // ── [作息·语气层 2026-10-19] ─────────────────────────────────────────────────
+  // 底层的睡/醒状态机（深夜窗口 / 口令叫醒 / 说梦话）早就有了，这里只补「像人」的语气：
+  // 三个时刻给一句话——①刚被口令从睡眠里拽起来（前 10 分钟懵）②睡前一小时犯困 ③起床后
+  // 一小时没睡醒。都不改唤醒闸门（那是 sleepStateV2 的事），只影响说话的样子。
+  function sleepToneLineV2(key) {
+    const st = getSocialV2State(key);
+    if (!st) return '';
+    const s = sleepCfgV2();
+    if (s.enabled === false) return '';
+    const now = Date.now();
+    // ① 刚被叫醒：sleepAwakeUntil 只在 wakeFromSleepV2（口令叫醒）里设置，正好是要的场景。
+    const awakeUntil = Number(st.sleepAwakeUntil) || 0;
+    if (awakeUntil > now && awakeUntil - now > sleepAwakeGraceMsV2() - 10 * 60000) {
+      return '【刚被叫醒】你是刚被「醒醒/起床」这类口令从睡眠里硬拽起来的，人还有点懵：回话短一点、慢半拍，可以带点起床气或迷糊劲，别立刻满血复活。\n\n';
+    }
+    const clock = peakClockV2(s.timeZone || 'Asia/Shanghai');
+    if (!clock) return '';
+    const wins = Array.isArray(s.nightWindows) && s.nightWindows.length ? s.nightWindows : SLEEP_DEFAULT_NIGHT_WINDOWS_V2;
+    for (const w of wins) {
+      const start = hhmmToMinutesV2(w[0]);
+      const end = hhmmToMinutesV2(w[1]);
+      if (start < 0 || end < 0) continue;
+      // ② 睡前一小时：夜深了，人开始困。
+      if (clock.minutes >= start - 60 && clock.minutes < start) {
+        return '【夜深了】快到你平时睡觉的时间了，你现在有点困：话变少变短、语气变软变懒，聊不起来劲。\n\n';
+      }
+      // ③ 起床后一小时：刚睡醒的迷糊劲儿。
+      if (clock.minutes >= end && clock.minutes < end + 60) {
+        return '【刚睡醒】你刚睡醒没多久：还有点迷糊，像刚拿起手机看到消息的样子，别一上来就元气满满。\n\n';
+      }
+    }
+    return '';
+  }
+
   // ── [养鱼·每日巡园 2026-10-19] ─────────────────────────────────────────────
   // 每天一次把「去 B 站逛逛」的任务派给主人私聊：她用 bili_hot/user_videos 逛、挑视频
   // 用人设口吻 bili_post_comment（顺眼就点赞投币），再向主人汇报。频控在库层硬限
@@ -7046,6 +7081,82 @@ async function main() {
     log(`[巡园] ${key} 今日 B 站巡园任务下发（${hour} 点档）`);
     appendActivity(`${key} [养鱼] 每日 B 站巡园任务`);
     try { scheduleWakeV2(key, 'biliStroll'); } catch (error) { log('[巡园] 调度失败:', error?.message ?? error); }
+  }
+
+  // ── [养鱼·追更安利 2026-10-19] ───────────────────────────────────────────────
+  // 她关注的 UP 主更新了，她主动来安利。配置名单在 socialV2.biliFollow.list（[{mid,name}]），
+  // 水位（各 UP 最新投稿 bvid）存在主人私聊会话的 biliFollowState，判新规则在
+  // social-mechanisms.js 的 diffBiliFollowsV2（可单测）。检查本身是只读 API，不占写额度。
+  // 默认在 19~23 点的空闲时段窗口内查（峰谷半价），一天最多 checksPerDay 次。
+  function biliFollowCfgV2() {
+    const c = cfg.socialV2?.biliFollow && typeof cfg.socialV2.biliFollow === 'object' ? cfg.socialV2.biliFollow : {};
+    const list = Array.isArray(c.list)
+      ? c.list.map((f) => ({ mid: String(f?.mid || '').replace(/\D/g, ''), name: String(f?.name || '').trim().slice(0, 60) }))
+        .filter((f) => /^\d{5,}$/.test(f.mid)).slice(0, 10)
+      : [];
+    return {
+      enabled: c.enabled === true && list.length > 0,
+      minHour: Math.min(23, Math.max(0, Number.isFinite(Number(c.minHour)) ? Number(c.minHour) : 19)),
+      maxHour: Math.min(23, Math.max(0, Number.isFinite(Number(c.maxHour)) ? Number(c.maxHour) : 23)),
+      checksPerDay: Math.min(6, Math.max(1, Number(c.checksPerDay ?? 2))),
+      list
+    };
+  }
+  // 只读 B 站客户端：桥接进程内自建一个（和 MCP 号的频控/登录完全无关，互不影响）。
+  let biliClientV2Ref = null;
+  function biliClientV2() {
+    if (!biliClientV2Ref) biliClientV2Ref = createBili({ fetchImpl: (typeof fetch === 'function' ? fetch : undefined), log: (m) => log('[追更]', m) });
+    return biliClientV2Ref;
+  }
+  function biliFollowTickV2() {
+    const c = biliFollowCfgV2();
+    if (!c.enabled || currentMode !== 'reserved2' || socialV2.paused) return;
+    const ownerKey = 'private:' + String(cfg.ownerQQ ?? '');
+    const st = socialV2.conversations.get(ownerKey);
+    if (!st) return;
+    const hour = new Date().getHours();
+    if (hour < c.minHour || hour > c.maxHour) return;
+    // 判重水位：{ day, checks, done } —— done=今天已经安利过一轮就不再查（一天最多安利一轮）。
+    const today = localDayString(0);
+    if (!st.biliFollowCheck || st.biliFollowCheck.day !== today) st.biliFollowCheck = { day: today, checks: 0, done: false };
+    if (st.biliFollowCheck.done || st.biliFollowCheck.checks >= c.checksPerDay) return;
+    st.biliFollowCheck.checks += 1;
+    saveSocialV2State();
+    // 并发抓各 UP 最新投稿（userVideos 只读，单个失败不影响其他）。
+    const results = new Map();
+    Promise.all(c.list.map(async (f) => {
+      try { results.set(f.mid, await biliClientV2().userVideos(f.mid, { limit: 1 })); }
+      catch (error) { log(`[追更] 抓 ${f.name || f.mid} 投稿失败：${error?.message ?? error}`); }
+    })).then(() => {
+      const r = diffBiliFollowsV2(c.list, st.biliFollowState, results);
+      st.biliFollowState = r.state;
+      if (r.updates.length) {
+        // 一天最多安利一轮：有更新就投递并标记 done，没更新保持 done=false 让下次窗口再查。
+        st.biliFollowCheck.done = true;
+        // 目标会话：当天消息最多的允许群（安利要有人听），没有就发主人私聊。
+        let target = ownerKey;
+        try {
+          const mdbRef = memoryDbEnabled() ? memoryDb() : null;
+          let best = null, bestN = 4; // 少于 5 条的群今天基本没人，别去唱独角戏
+          if (mdbRef && typeof mdbRef.keyStats === 'function') {
+            for (const k of socialV2.conversations.keys()) {
+              if (!k.startsWith('group:') || !isSessionAllowedInCurrentMode(k)) continue;
+              const n = Number(mdbRef.keyStats(today, k)?.messages) || 0;
+              if (n > bestN) { best = k; bestN = n; }
+            }
+          }
+          if (best) target = best;
+        } catch { /* 目标选失败就发主人私聊 */ }
+        socialV2.pendingBiliFollow = { key: target, at: Date.now(), items: r.updates.slice(0, 3) };
+        saveSocialV2State();
+        log(`[追更] ${r.updates.length} 个 UP 更新了，安排安利 → ${target}`);
+        appendActivity(`${target} [养鱼] 追更安利：${r.updates.map((u) => u.name).join('、')}`);
+        try { scheduleWakeV2(target, 'biliFollow'); } catch (error) { log('[追更] 调度失败:', error?.message ?? error); }
+      } else {
+        saveSocialV2State();
+        log(`[追更] 第 ${st.biliFollowCheck.checks}/${c.checksPerDay} 次检查完成，没有新投稿`);
+      }
+    }).catch((error) => log('[追更] 检查异常:', error?.message ?? error));
   }
 
   // ── [长记忆 2026-10-18] 自动提炼 + 定期整理 ─────────────────────────────────
@@ -9393,6 +9504,7 @@ async function main() {
     groupRecapTargetDayV2,
     grumpSignalsV2,
     historyRecallV2,
+    sleepToneLineV2,
     log,
     looksLikeUnfinished,
     longMemoryRecallV2,
@@ -10509,6 +10621,8 @@ async function main() {
     if (cfg.socialV2?.enabled === false || socialV2.paused) return;
     // [养鱼] 每日巡园检查搭同一只 60s tick（日期判重，一天最多一次）。
     try { biliStrollTickV2(); } catch (error) { log(`[巡园] tick 异常：${error?.message ?? error}`); }
+    // [养鱼·追更] 关注的 UP 主有没有更新（只读 API，空闲时段窗口内一天最多查几次）。
+    try { biliFollowTickV2(); } catch (error) { log(`[追更] tick 异常：${error?.message ?? error}`); }
     for (const key of socialV2.conversations.keys()) {
       if (!isSessionAllowedInCurrentMode(key)) continue;
       const st = socialV2.conversations.get(key);
@@ -10993,6 +11107,8 @@ async function main() {
     anyMessage: 50,
     // [养鱼] 每日巡园任务：比真实消息低、比主动冒泡高 —— 是她该做的日常，但永远给真人让路。
     biliStroll: 44,
+    // [养鱼·追更] UP 更新安利：比巡园略高一点（新投稿有时效性，隔天就成旧闻了），仍给真人让路。
+    biliFollow: 46,
     replyCheck: 40,
     timeout: 30,
     proactiveCheck: 20,

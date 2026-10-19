@@ -95,7 +95,9 @@ export function createSocialState(S) {
         coldShoulder: {},
         lastMemorySelfCheckAt: 0,
         // [养鱼] 每日 B 站巡园：该 key（主人私聊）最近一次领任务的日期。
-        lastBiliStrollDay: ''
+        lastBiliStrollDay: '',
+        // [养鱼·追更] 关注的 UP 主最新投稿水位 { [mid]: { name, lastBvid, lastTitle, lastPubdate, seeded } }。
+        biliFollowState: {}
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
@@ -225,7 +227,24 @@ export function createSocialState(S) {
               return clean;
             })(),
             lastMemorySelfCheckAt: Number(val.lastMemorySelfCheckAt) || 0,
-            lastBiliStrollDay: String(val.lastBiliStrollDay || '')
+            lastBiliStrollDay: String(val.lastBiliStrollDay || ''),
+            // [养鱼·追更] 水位归一化：只留结构完整的条目，键名挡掉原型链污染。
+            biliFollowState: (() => {
+              const raw = (val.biliFollowState && typeof val.biliFollowState === 'object') ? val.biliFollowState : {};
+              const clean = {};
+              for (const [k, v] of Object.entries(raw)) {
+                if (!/^\d{5,}$/.test(k) || !v || typeof v !== 'object') continue;
+                if (!String(v.lastBvid || '').trim()) continue;
+                clean[k] = {
+                  name: String(v.name || '').slice(0, 60),
+                  lastBvid: String(v.lastBvid).slice(0, 20),
+                  lastTitle: String(v.lastTitle || '').slice(0, 120),
+                  lastPubdate: Number(v.lastPubdate) || 0,
+                  seeded: v.seeded !== false
+                };
+              }
+              return clean;
+            })()
           };
           // 旧状态/异常状态里的指定成员名单也统一归一化，防止“null”/非法值污染。
           if (st.wakeConfig?.triggers && typeof st.wakeConfig.triggers === 'object') {
@@ -341,7 +360,9 @@ export function createSocialState(S) {
           followUps: Array.isArray(st.followUps) ? st.followUps.slice(-20) : [],
           coldShoulder: st.coldShoulder && typeof st.coldShoulder === 'object' ? st.coldShoulder : {},
           lastMemorySelfCheckAt: Number(st.lastMemorySelfCheckAt) || 0,
-          lastBiliStrollDay: String(st.lastBiliStrollDay || '')
+          lastBiliStrollDay: String(st.lastBiliStrollDay || ''),
+          // [养鱼·追更] 水位跨重启保留（lastBvid 判新就靠它）。
+          biliFollowState: st.biliFollowState && typeof st.biliFollowState === 'object' ? st.biliFollowState : {}
         };
       }
       atomicWriteJson(SOCIAL_V2_FILE, obj);
