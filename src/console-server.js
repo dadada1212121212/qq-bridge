@@ -2009,6 +2009,33 @@ export function createConsoleServer(S) {
           }
           return;
         }
+        if (req.method === 'GET' && url.pathname === '/api/bili/status') {
+          // [养鱼面板 2026-10-19] B 站肥鱼号状态：账号是否已接入 + 今日额度用量 + 上次巡园日。
+          // 只读本地文件（不碰网络、不查 B 站），控制台随时能刷。
+          const CAPS = { comments: 5, likes: 20, coins: 2 };
+          const today = new Date().toISOString().slice(0, 10);
+          let account = false;
+          try {
+            const a = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'bili-account.json'), 'utf8'));
+            account = !!(a?.SESSDATA && a?.bili_jct && a?.DedeUserID);
+          } catch { /* 还没导入 cookie */ }
+          const quota = { day: today, comments: 0, likes: 0, coins: 0 };
+          try {
+            const j = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'bili-quota.json'), 'utf8'));
+            if (j?.day === today) {
+              quota.comments = Array.isArray(j.comments) ? j.comments.length : 0;
+              quota.likes = Array.isArray(j.likes) ? j.likes.length : 0;
+              quota.coins = Array.isArray(j.coins) ? j.coins.length : 0;
+            }
+          } catch { /* 今天还没动过 */ }
+          let lastStroll = '还没巡过园';
+          try {
+            const sv = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'social-v2.json'), 'utf8'));
+            lastStroll = String(sv?.conversations?.[`private:${cfg?.ownerQQ ?? ''}`]?.lastBiliStrollDay || '') || lastStroll;
+          } catch { /* */ }
+          sendJson({ ok: true, account, quota: { ...quota, caps: CAPS }, lastStroll });
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/cfgmods/history') {
           const h = cfgmodReadHistory(path.join(ROOT, 'state', 'cfgmods-history.json'));
           sendJson({ ok: true, history: h.slice(-40).reverse() });

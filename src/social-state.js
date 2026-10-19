@@ -93,7 +93,9 @@ export function createSocialState(S) {
         // [拟人四件套] 事件跟进台账 / 对人冷场余波 / 超长记忆自检水位。
         followUps: [],
         coldShoulder: {},
-        lastMemorySelfCheckAt: 0
+        lastMemorySelfCheckAt: 0,
+        // [养鱼] 每日 B 站巡园：该 key（主人私聊）最近一次领任务的日期。
+        lastBiliStrollDay: ''
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
@@ -222,7 +224,8 @@ export function createSocialState(S) {
               }
               return clean;
             })(),
-            lastMemorySelfCheckAt: Number(val.lastMemorySelfCheckAt) || 0
+            lastMemorySelfCheckAt: Number(val.lastMemorySelfCheckAt) || 0,
+            lastBiliStrollDay: String(val.lastBiliStrollDay || '')
           };
           // 旧状态/异常状态里的指定成员名单也统一归一化，防止“null”/非法值污染。
           if (st.wakeConfig?.triggers && typeof st.wakeConfig.triggers === 'object') {
@@ -337,7 +340,8 @@ export function createSocialState(S) {
           // [拟人四件套] 事件可能好几天后才到期，冷场余波、自检水位同理，都得跨重启。
           followUps: Array.isArray(st.followUps) ? st.followUps.slice(-20) : [],
           coldShoulder: st.coldShoulder && typeof st.coldShoulder === 'object' ? st.coldShoulder : {},
-          lastMemorySelfCheckAt: Number(st.lastMemorySelfCheckAt) || 0
+          lastMemorySelfCheckAt: Number(st.lastMemorySelfCheckAt) || 0,
+          lastBiliStrollDay: String(st.lastBiliStrollDay || '')
         };
       }
       atomicWriteJson(SOCIAL_V2_FILE, obj);

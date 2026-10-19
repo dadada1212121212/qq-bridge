@@ -7016,6 +7016,38 @@ async function main() {
     }
   }
 
+  // ── [养鱼·每日巡园 2026-10-19] ─────────────────────────────────────────────
+  // 每天一次把「去 B 站逛逛」的任务派给主人私聊：她用 bili_hot/user_videos 逛、挑视频
+  // 用人设口吻 bili_post_comment（顺眼就点赞投币），再向主人汇报。频控在库层硬限
+  // （评论 5/天…），巡园只负责「别忘了逛」。默认 14~21 点窗口内随机触发，一天最多一次。
+  function biliStrollCfgV2() {
+    const c = cfg.socialV2?.biliStroll && typeof cfg.socialV2.biliStroll === 'object' ? cfg.socialV2.biliStroll : {};
+    return {
+      enabled: c.enabled === true,
+      minHour: Math.min(23, Math.max(0, Number.isFinite(Number(c.minHour)) ? Number(c.minHour) : 14)),
+      maxHour: Math.min(23, Math.max(0, Number.isFinite(Number(c.maxHour)) ? Number(c.maxHour) : 21)),
+      hourlyProbability: Math.min(1, Math.max(0.01, Number(c.hourlyProbability ?? 0.3)))
+    };
+  }
+
+  function biliStrollTickV2() {
+    const c = biliStrollCfgV2();
+    if (!c.enabled || currentMode !== 'reserved2' || socialV2.paused) return;
+    const key = 'private:' + String(cfg.ownerQQ ?? '');
+    const st = socialV2.conversations.get(key);
+    if (!st) return; // 主人私聊会话还没初始化，跳过
+    const today = localDayString(0);
+    if (st.lastBiliStrollDay === today) return;
+    const hour = new Date().getHours();
+    if (hour < c.minHour || hour > c.maxHour) return;
+    if (Math.random() >= c.hourlyProbability) return; // 窗口内 30%/tick → 几分钟内必然命中
+    st.lastBiliStrollDay = today;
+    saveSocialV2State();
+    log(`[巡园] ${key} 今日 B 站巡园任务下发（${hour} 点档）`);
+    appendActivity(`${key} [养鱼] 每日 B 站巡园任务`);
+    try { scheduleWakeV2(key, 'biliStroll'); } catch (error) { log('[巡园] 调度失败:', error?.message ?? error); }
+  }
+
   // ── [长记忆 2026-10-18] 自动提炼 + 定期整理 ─────────────────────────────────
   // 背景：库里 8052 条消息只长出 24 条 facts（几乎全靠她现场调工具写），会话又是每轮新开，
   // 所以她「不记得上周聊过什么」。这里每轮结束从新消息里规则式提炼几条事实入库（零模型调用），
@@ -10475,6 +10507,8 @@ async function main() {
   const PROMISE_INTERVAL_MS_V2 = 60000;
   function promiseDueTickV2() {
     if (cfg.socialV2?.enabled === false || socialV2.paused) return;
+    // [养鱼] 每日巡园检查搭同一只 60s tick（日期判重，一天最多一次）。
+    try { biliStrollTickV2(); } catch (error) { log(`[巡园] tick 异常：${error?.message ?? error}`); }
     for (const key of socialV2.conversations.keys()) {
       if (!isSessionAllowedInCurrentMode(key)) continue;
       const st = socialV2.conversations.get(key);
@@ -10957,6 +10991,8 @@ async function main() {
     // 反正真实的那个回合也会带着同一份台账。
     asks: 65,
     anyMessage: 50,
+    // [养鱼] 每日巡园任务：比真实消息低、比主动冒泡高 —— 是她该做的日常，但永远给真人让路。
+    biliStroll: 44,
     replyCheck: 40,
     timeout: 30,
     proactiveCheck: 20,

@@ -223,6 +223,7 @@ pre.output{margin:0;padding:12px 14px;border-radius:12px;background:var(--surfac
     <button class="nav-item" data-view="plugins"><span class="ico">⧉</span>插件</button>
     <button class="nav-item" data-view="cfgfiles"><span class="ico">⇪</span>配置文件</button>
     <button class="nav-item" data-view="costs"><span class="ico">¥</span>成本账本</button>
+    <button class="nav-item" data-view="bili"><span class="ico">🐟</span>B 站养鱼</button>
     <button class="nav-item" data-view="settings"><span class="ico">⚙</span>白名单与安全</button>
     <button class="nav-item" data-view="runtime"><span class="ico">⚡</span>省 token 与速度</button>
     <button class="nav-item" data-view="ops"><span class="ico">✦</span>运维</button>
@@ -520,7 +521,7 @@ function navCap() {
 }
 function loadView(view) {
   state.view = view;
-  var titles = { overview: '总览', sessions: '会话与唤醒', usage: '用量与花费', kb: '知识库', memes: '表情包仓库', memory: '记忆', persona: '人格与提示词', features: '功能开关', plugins: '插件', cfgfiles: '配置文件投递', costs: '成本账本', settings: '白名单与安全', runtime: '省 token 与速度', ops: '运维' };
+  var titles = { overview: '总览', sessions: '会话与唤醒', usage: '用量与花费', kb: '知识库', memes: '表情包仓库', memory: '记忆', persona: '人格与提示词', features: '功能开关', plugins: '插件', cfgfiles: '配置文件投递', costs: '成本账本', bili: 'B 站养鱼', settings: '白名单与安全', runtime: '省 token 与速度', ops: '运维' };
   $('page-title').textContent = titles[view] || view;
   document.querySelectorAll('.nav-item').forEach(function (b) { b.classList.toggle('active', b.dataset.view === view); });
   var box = $('view');
@@ -537,6 +538,7 @@ function loadView(view) {
   else if (view === 'plugins') job = renderPlugins();
   else if (view === 'cfgfiles') job = renderCfgfiles();
   else if (view === 'costs') job = renderCosts();
+  else if (view === 'bili') job = renderBili();
   else if (view === 'settings') job = renderSettings();
   else if (view === 'runtime') job = renderRuntime();
   else if (view === 'ops') job = renderOps();
@@ -578,6 +580,40 @@ function renderCosts() {
   }
   $('co-refresh').addEventListener('click', load);
   $('co-days').addEventListener('change', load);
+  load();
+}
+
+// ── B 站养鱼 ────────────────────────────────────────────────────────────
+function renderBili() {
+  var box = $('view');
+  box.innerHTML = '<div class="card"><h3>B 站养鱼 · 肥鱼号状态</h3>'
+    + '<p class="desc">她以肥鱼号在 B 站活动：拉评论/发评论/点赞/投币。频控是库层硬限（防封号），这里只显示今天用了多少。</p>'
+    + '<div style="margin:8px 0"><button id="bi-refresh" style="padding:6px 14px;border:1px solid #d8dee4;border-radius:8px;background:#fff;cursor:pointer">刷新</button></div>'
+    + '<div id="bi-body"></div></div>';
+  function load() {
+    $('bi-body').innerHTML = '<p class="desc">读取中…</p>';
+    api('/api/bili/status').then(function (r) {
+      if (!r.ok) { $('bi-body').innerHTML = '<p class="desc">读取失败：' + esc(r.error || '未知') + '</p>'; return; }
+      var q = r.quota || {}, caps = q.caps || {};
+      function bar(used, cap, label) {
+        var pct = Math.min(100, Math.round(100 * used / cap));
+        var color = pct >= 100 ? '#d73a49' : (pct >= 60 ? '#b08800' : '#28a745');
+        return '<div style="margin:8px 0"><div class="k">' + label + '　' + used + ' / ' + cap + '</div>'
+          + '<div style="background:#eef1f4;border-radius:6px;height:10px;width:280px;max-width:100%">'
+          + '<div style="background:' + color + ';border-radius:6px;height:10px;width:' + pct + '%"></div></div></div>';
+      }
+      $('bi-body').innerHTML = '<div class="kv">'
+        + '<div class="k">账号接入</div><div class="v">' + (r.account ? '<span class="badge ok">已导入 cookie</span>' : '<span class="badge warn">未接入</span>（跑 node scripts/bili-import-cookie.mjs "Cookie串"）') + '</div>'
+        + '<div class="k">上次巡园</div><div class="v">' + esc(r.lastStroll || '—') + '</div>'
+        + '</div>'
+        + '<h3 style="margin-top:14px">今日额度（' + esc(q.day || '') + '）</h3>'
+        + bar(q.comments || 0, caps.comments || 5, '评论')
+        + bar(q.likes || 0, caps.likes || 20, '点赞')
+        + bar(q.coins || 0, caps.coins || 2, '投币')
+        + '<p class="desc">额度在库层硬限（评论 5/天、点赞 20/天、投币 2/天、同类间隔 30 分钟、同视频每天只动一次），模型越不过去。每天 14~21 点她会自己在主人私聊领一次巡园任务。</p>';
+    }).catch(function (err) { $('bi-body').innerHTML = '<p class="desc">加载失败：' + esc(err.message) + '</p>'; });
+  }
+  $('bi-refresh').addEventListener('click', load);
   load();
 }
 
