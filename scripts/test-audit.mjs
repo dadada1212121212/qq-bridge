@@ -135,6 +135,16 @@ const tests = [
   'test-long-memory.mjs',
   // [QQ 唤醒器] 命令解析 / 鉴权 / 配置白名单。
   'test-wake-bot.mjs',
+  // [patch 主号启动器守护循环] run-qqbridge.cmd 2026-10-19 补上 fish 号同款 5 秒重启
+  // 循环（主号崩一次要等 3 分钟保活，空窗 ~4.5 分钟）。循环的唯一红线是 /stop 停机
+  // 语义：hold 判定（isHoldActive + CLI 退出码）必须与 start-services.ps1 逐条对齐，
+  // 否则「循环觉得该停、保活觉得该拉」打起来，或 /stop 被循环直接打穿。
+  'test-hold-state.mjs',
+  // [patch AstrBot 看门狗] 两条实录教训：①「事件循环卡死 3.5 小时」是 Modern Standby
+  // （S0 新型待机）冻住整个桌面栈的假警报（05:08 进待机 → 09:08 唤醒，诊断在唤醒后
+  // 1 秒记 lag），退出过待机就不重启；② 老重启路径盲 spawn + SilentlyContinue，
+  // 点了重启真身没杀掉（09:08 实录），新路按端口占用者杀（防命令行匹配误伤）。
+  'test-astrbot-watch.mjs',
   'test-fresh-session.mjs',
   'test-thinking-filler.mjs',
 ];
