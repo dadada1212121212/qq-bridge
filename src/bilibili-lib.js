@@ -1,0 +1,223 @@
+// B 站只读数据层（给 mcp-bilibili.js 用，也可脱离 MCP 单测）。
+//
+// 为什么单独成文件：wbi 签名、风控兜底、输出格式都是纯逻辑，要在 scripts/test-bilibili-lib.mjs
+// 里脱离 MCP 进程真跑/单测；MCP 服务器文件只做工具壳。
+//
+// 安全边界：只有只读的公开数据接口（搜索/视频信息/热门/用户信息）。
+// 不带登录 cookie、不做任何写操作（点赞/投币/发弹幕一概没有）。
+//
+// 接口风控现状（2026-10）：
+//   · x/web-interface/view、x/web-interface/popular、x/web-interface/card：公开，无需签名；
+//   · x/web-interface/wbi/search/*：需要 wbi 签名（w_rid/wts）+ buvid3 cookie，否则 -412。
+// buvid3 用公开的 finger/spi 接口现取（无需登录），wbi key 用 nav 接口现取（缓存 1h）。
+import crypto from 'node:crypto';
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const API = 'https://api.bilibili.com';
+
+// wbi 混淆表（bilibili-API-collect 社区维护的公开常量）。
+const MIXIN_TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52];
+
+/** 按混淆表从 img_key+sub_key 取出 32 位 mixin key。 */
+export function mixinKey(imgKey, subKey) {
+  const raw = String(imgKey || '') + String(subKey || '');
+  if (raw.length < 32) throw new Error('wbi key 长度不足');
+  return MIXIN_TAB.map((i) => raw[i]).join('').slice(0, 32);
+}
+
+/** 给参数加 wts 并签名，返回可拼接的 query（含 w_rid）。值里的 !'()* 按 wbi 规范去除。 */
+export function wbiSign(params, imgKey, subKey, wts = Math.floor(Date.now() / 1000)) {
+  const mk = mixinKey(imgKey, subKey);
+  const clean = { ...params, wts };
+  const query = Object.keys(clean)
+    .sort()
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(String(clean[k]).replace(/[!'()*]/g, ''))}`)
+    .join('&');
+  const w_rid = crypto.createHash('md5').update(query + mk).digest('hex');
+  return `${query}&w_rid=${w_rid}`;
+}
+
+/** 从「BV 号 / av 号 / 纯数字 / 完整链接」里解析视频标识；解析不出返回 null。 */
+export function parseVideoId(input) {
+  const s = String(input || '').trim();
+  let m = s.match(/BV[0-9A-Za-z]{10}/);
+  if (m) return { bvid: m[0] };
+  m = s.match(/av(\d{3,})/i) || s.match(/^(\d{6,})$/);
+  if (m) return { aid: m[1] };
+  return null;
+}
+
+export function createBili({ fetchImpl, log = () => {} } = {}) {
+  const f = fetchImpl || (typeof fetch === 'function' ? fetch : null);
+  if (!f) throw new Error('没有可用的 fetch（node 18+ 或显式传入 fetchImpl）');
+  let wbiCache = null; // { imgKey, subKey, at }
+  let buvidCache = null; // { buvid3, at }
+
+  async function rawJson(url, { timeoutMs = 8000 } = {}) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await f(url, {
+        signal: ctrl.signal,
+        headers: {
+          'user-agent': UA,
+          referer: 'https://www.bilibili.com/',
+          origin: 'https://www.bilibili.com'
+        }
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status ?? res.statusCode}`);
+      return await res.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function getBuvid3() {
+    if (buvidCache && Date.now() - buvidCache.at < 6 * 3600000) return buvidCache.buvid3;
+    try {
+      const j = await rawJson(`${API}/x/frontend/finger/spi`);
+      const b3 = j?.data?.b_3;
+      if (b3) { buvidCache = { buvid3: b3, at: Date.now() }; return b3; }
+    } catch (e) { log('[bilibili] 取 buvid3 失败（兜底用随机值）:', e?.message || e); }
+    const fallback = crypto.randomUUID();
+    buvidCache = { buvid3: fallback, at: Date.now() };
+    return fallback;
+  }
+
+  async function getWbiKeys() {
+    if (wbiCache && Date.now() - wbiCache.at < 3600000) return wbiCache;
+    const j = await rawJson(`${API}/x/web-interface/nav`);
+    const img = String(j?.data?.wbi_img?.img_url || '');
+    const sub = String(j?.data?.wbi_img?.sub_url || '');
+    const imgKey = img.split('/').pop()?.replace(/\.\w+$/, '');
+    const subKey = sub.split('/').pop()?.replace(/\.\w+$/, '');
+    if (!imgKey || !subKey) throw new Error('nav 接口没给出 wbi key');
+    wbiCache = { imgKey, subKey, at: Date.now() };
+    return wbiCache;
+  }
+
+  async function biliGet(pathAndQuery, { signed = false } = {}) {
+    const buvid3 = await getBuvid3();
+    let url = API + pathAndQuery;
+    if (signed) {
+      const { imgKey, subKey } = await getWbiKeys();
+      const [path, qs] = pathAndQuery.split('?');
+      const params = Object.fromEntries(new URLSearchParams(qs || ''));
+      url = `${API}${path}?${wbiSign(params, imgKey, subKey)}`;
+    }
+    const j = await rawJson(url, { });
+    if (j?.code === -412) throw new Error('B 站风控（-412）：稍等几分钟再试，或换个说法再搜');
+    if (j?.code !== 0) throw new Error(`B 站接口返回 ${j?.code ?? '?'}：${j?.message || j?.msg || '未知原因'}`);
+    return j.data;
+  }
+
+  /** 搜视频/用户。kind: 'video' | 'user'。返回归一化数组（不格式化，格式化交给 formatXxx）。 */
+  async function search(keyword, { kind = 'video', limit = 6 } = {}) {
+    const st = kind === 'user' ? 'bili_user' : 'video';
+    const data = await biliGet(`/x/web-interface/wbi/search/type?search_type=${st}&keyword=${encodeURIComponent(String(keyword || '').slice(0, 60))}&page=1`, { signed: true });
+    const list = Array.isArray(data?.result) ? data.result : [];
+    const out = [];
+    for (const r of list) {
+      if (kind === 'user') {
+        const mid = r.mid != null ? String(r.mid) : '';
+        if (!mid) continue;
+        out.push({ kind: 'user', mid, name: stripEm(r.uname), sign: stripEm(r.usign || ''), fans: Number(r.fans) || 0, videos: Number(r.videos) || 0 });
+      } else {
+        const bvid = r.bvid;
+        if (!bvid) continue;
+        out.push({
+          kind: 'video', bvid,
+          title: stripEm(r.title),
+          author: stripEm(r.author || ''),
+          play: Number(r.play) || 0, danmaku: Number(r.video_review) || Number(r.danmaku) || 0,
+          duration: String(r.duration || ''), pubdate: Number(r.pubdate) || 0,
+          url: `https://www.bilibili.com/video/${bvid}`
+        });
+      }
+      if (out.length >= Math.min(10, Math.max(1, limit))) break;
+    }
+    return out;
+  }
+
+  /** 视频详情。input 支持 BV 号 / av 号 / 纯数字 / 完整链接。 */
+  async function videoInfo(input) {
+    const id = parseVideoId(input);
+    if (!id) throw new Error('认不出视频标识：给 BV 号、av 号或 bilibili 视频链接');
+    const q = id.bvid ? `bvid=${id.bvid}` : `aid=${id.aid}`;
+    const d = await biliGet(`/x/web-interface/view?${q}`);
+    return {
+      bvid: d.bvid, aid: d.aid, title: stripEm(d.title),
+      up: stripEm(d.owner?.name || ''), mid: d.owner?.mid != null ? String(d.owner.mid) : '',
+      play: Number(d.stat?.view) || 0, danmaku: Number(d.stat?.danmaku) || 0,
+      like: Number(d.stat?.like) || 0, coin: Number(d.stat?.coin) || 0, favorite: Number(d.stat?.favorite) || 0,
+      reply: Number(d.stat?.reply) || 0, duration: Number(d.duration) || 0,
+      pubdate: Number(d.pubdate) || 0, desc: stripEm(String(d.desc || '')).slice(0, 160),
+      url: `https://www.bilibili.com/video/${d.bvid}`
+    };
+  }
+
+  /** 当前热门（综合热门页）。 */
+  async function popular({ limit = 6 } = {}) {
+    const d = await biliGet('/x/web-interface/popular?ps=20&pn=1');
+    const list = Array.isArray(d?.list) ? d.list : [];
+    return list.slice(0, Math.min(10, Math.max(1, limit))).map((v) => ({
+      kind: 'video', bvid: v.bvid, title: stripEm(v.title), author: stripEm(v.owner?.name || ''),
+      play: Number(v.stat?.view) || 0, danmaku: Number(v.stat?.danmaku) || 0,
+      duration: Number(v.duration) || 0, pubdate: Number(v.pubdate) || 0,
+      url: `https://www.bilibili.com/video/${v.bvid}`
+    }));
+  }
+
+  /** 用户信息。input 支持 mid 或昵称（昵称先搜人再取卡片）。 */
+  async function userInfo(input) {
+    const s = String(input || '').trim();
+    let mid = /^\d{5,}$/.test(s) ? s : '';
+    let searched = null;
+    if (!mid) {
+      searched = await search(s, { kind: 'user', limit: 3 });
+      if (!searched.length) throw new Error('没搜到这个 UP 主，换个名字试试');
+      mid = searched[0].mid;
+    }
+    const d = await biliGet(`/x/web-interface/card?mid=${mid}`);
+    return {
+      mid: String(d.card?.mid ?? mid),
+      name: stripEm(d.card?.name || (searched?.[0]?.name) || ''),
+      sign: stripEm(d.card?.sign || ''),
+      fans: Number(d.card?.fans) || 0, videos: Number(d.card?.archive_count) || (searched?.[0]?.videos) || 0
+    };
+  }
+
+  return { search, videoInfo, popular, userInfo, _internal: { getBuvid3, getWbiKeys, biliGet } };
+}
+
+/** 去掉搜索结果标题里的 <em class="keyword"> 高亮标签。 */
+export function stripEm(s) {
+  return String(s ?? '').replace(/<em[^>]*>/g, '').replace(/<\/em>/g, '');
+}
+
+export function formatDuration(sec) {
+  const n = Number(sec) || 0;
+  const m = Math.floor(n / 60), r = Math.floor(n % 60);
+  return `${m}:${String(r).padStart(2, '0')}`;
+}
+
+function compactCount(n) {
+  const v = Number(n) || 0;
+  if (v >= 100000000) return (v / 100000000).toFixed(1).replace(/\.0$/, '') + '亿';
+  if (v >= 10000) return (v / 10000).toFixed(1).replace(/\.0$/, '') + '万';
+  return String(v);
+}
+
+/** 一条视频 → 一行紧凑文本（给模型看，也方便她直接转述）。 */
+export function formatVideo(v, i) {
+  const idx = i != null ? `${i}. ` : '';
+  const date = v.pubdate ? new Date(v.pubdate * 1000).toISOString().slice(0, 10) : '';
+  const dur = v.duration ? ` ${typeof v.duration === 'string' ? v.duration : formatDuration(v.duration)}` : '';
+  return `${idx}${v.title}｜UP:${v.author || '?'}｜${compactCount(v.play)}播放·${compactCount(v.danmaku)}弹幕${dur}${date ? '｜' + date : ''}｜${v.url}`;
+}
+
+export function formatVideos(list, { header } = {}) {
+  if (!Array.isArray(list) || !list.length) return String(header || '') + '（没有结果）'.trim();
+  const lines = list.map((v, i) => formatVideo(v, i + 1));
+  return (header ? header + '\n' : '') + lines.join('\n');
+}

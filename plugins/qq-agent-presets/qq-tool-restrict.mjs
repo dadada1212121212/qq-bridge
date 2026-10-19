@@ -341,6 +341,8 @@ const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  // B 站只读工具（搜索/视频/热门/UP 主）：无登录、无写操作，所有会话可安全使用。
+  'mcp__bilibili-safe__',
 ]
 
 /**

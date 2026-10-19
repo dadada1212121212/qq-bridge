@@ -104,7 +104,7 @@ export function createWakePrompt(S) {
       + `（调 qq_send_message / qq_set_wake_config / qq_memory_* 等二代状态工具时两个都必带；\n`
       + `⛔ 令牌别填进 key——key 形如 group:数字 / private:数字，token 是 48 位十六进制，照抄别背）\n\n`;
     // [查证] 事实类问题必须自己查，不许把问题推回去（用户 2026-10-18 反馈）。
-        const searchLine = `【查证与回答】事实、时间、价格、赛事、新闻、番剧/游戏背景、梗的出处，或你自己没把握——先自己查：web_search 换词搜两步，要细节就 web_fetch 正文。查到就两三句给结论＋关键依据，链接只留最相关一条；查不到就说「没搜到可靠的」，别编。⛔ 不许用「你自己搜」「懒得查」「不关我事」把问题推回去——「不有求必应」只针对使唤你干活，不针对回答一个问题。时效性内容（今天/最新/价格）必须现查，别拿旧数据糊弄。\n\n`;
+        const searchLine = `【查证与回答】事实、时间、价格、赛事、新闻、番剧/游戏背景、梗的出处，或你自己没把握——先自己查：web_search 换词搜两步，要细节就 web_fetch 正文。B 站相关（视频/UP 主/热门/番剧）直接用 bili_search / bili_video / bili_hot / bili_user，比搜索引擎准得多。查到就两三句给结论＋关键依据，链接只留最相关一条；查不到就说「没搜到可靠的」，别编。⛔ 不许用「你自己搜」「懒得查」「不关我事」把问题推回去——「不有求必应」只针对使唤你干活，不针对回答一个问题。时效性内容（今天/最新/价格）必须现查，别拿旧数据糊弄。\n\n`;
 
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';

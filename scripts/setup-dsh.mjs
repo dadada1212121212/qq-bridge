@@ -171,7 +171,7 @@ const EXTRA_BRIDGES = resolveExtraBridges();
 const EXTRA_MCP_IDS = EXTRA_BRIDGES.flatMap((b) => [`mcp-snowluma-${b.slot}`, `mcp-snowluma-host-${b.slot}`]);
 
 // 由桥接托管的 MCP 条目 id：脚本对这几个 id 拥有所有权，可安全地按 id 增删。
-const MANAGED_MCP_IDS = ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe', 'mcp-phone-adb', ...EXTRA_MCP_IDS];
+const MANAGED_MCP_IDS = ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe', 'mcp-bilibili', 'mcp-phone-adb', ...EXTRA_MCP_IDS];
 
 // 手机控制工具的仓库位置：与本仓库同级（ungrouped/phone-adb），可用环境变量覆盖。
 const PHONE_ADB_DIR = process.env.PHONE_ADB_DIR || path.resolve(REPO_ROOT, '..', 'phone-adb');
@@ -228,6 +228,8 @@ function mcpEntries() {
     'mcp-snowluma': { serverName: 'snowluma', script: path.join(REPO_ROOT, 'src', 'mcp-snowluma-safe.js'), toolCallTimeoutMs: 725000 },
     'mcp-snowluma-host': { serverName: 'snowluma-host', script: path.join(REPO_ROOT, 'src', 'mcp-host-server.js') },
     'mcp-web-search-safe': { serverName: 'web-search-safe', script: path.join(REPO_ROOT, 'src', 'mcp-web-search-safe.js') },
+    // B 站只读工具（搜索/视频/热门/UP 主）：2026-10-19 加，安全边界见 src/bilibili-lib.js 头注释。
+    'mcp-bilibili': { serverName: 'bilibili-safe', script: path.join(REPO_ROOT, 'src', 'mcp-bilibili.js') },
     // 手机控制：用 Python 跑（零依赖、直接 import phone.py；见 phone-adb/mcp_phone_adb.py 头部说明）。
     'mcp-phone-adb': python && fs.existsSync(phoneScript)
       ? { serverName: 'phone-adb', command: python, args: [phoneScript] }
