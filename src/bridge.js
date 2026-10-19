@@ -3152,6 +3152,9 @@ async function main() {
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
+  // [省步 2026-10-19] sessionId -> { turnStart, steps, nudged }：回合内工具步计数，
+  // 连续 afterSteps 步还没发过消息就 queue 一句 nudge 逼收尾（账本「回合后续 3 步」占 40%）。
+  const stepNudgeStateV2 = new Map();
   // [patch 卡死回合看门狗] sessionId -> 最近一次收到该会话任何事件的时间。
   // 为什么要它：turn/start 之后如果 turn/end 事件丢了（连接抖动、DSH 重启竞态），v2TurnStartAt 会一直留着，
   // isConversationBusyV2 永久为 true → 该会话所有新唤醒都被塞进 pendingWakeReasons 且永远等不到排空，
@@ -5178,6 +5181,65 @@ async function main() {
     log(`[长思考] ${key} 已经想了 ${Math.round(info.elapsedMs / 1000)}s 还没开口，先垫一句「${fillerText}」`);
     appendActivity(`${key} 长思考垫场：${fillerText}`);
     sendToQQ(key, fillerText);
+  }
+
+  // ── [省步 nudge 2026-10-19] 回合内连续 N 步没发消息就逼收尾 ─────────────────
+  // 账本口径：回合后续的 3 步占月账单 40%（¥22/月）。提示词里早就有【省一步】，
+  // 但实测平均还是 3 步 —— 光靠提一遍压不住，得在她真的走弯路时当场补一句。
+  // 触发：一个回合内第 afterSteps 次「带工具调用的 assistant 消息」出现、且至今
+  // 没有任何发送类工具成功 → queue 一句超短 nudge。一回合最多 nudge 一次。
+  function stepNudgeCfgV2() {
+    const c = cfg.socialV2?.stepNudge && typeof cfg.socialV2.stepNudge === 'object' ? cfg.socialV2.stepNudge : {};
+    return {
+      enabled: c.enabled !== false,
+      afterSteps: Math.min(8, Math.max(2, Number(c.afterSteps) || 3))
+    };
+  }
+
+  const STEP_NUDGE_TEXT_V2 = '【省一步】你已经连着调了好几步工具还没发消息。有话说就现在用 qq_send_message 发出来（能并步就一次调完），说完 qq_set_wake_config 收尾；别再确认、别再查了。';
+
+  // 纯判定：抽出来单独测（scripts/test-step-nudge.mjs），不做任何 IO。
+  function stepNudgeDueV2(info) {
+    if (!info || info.enabled !== true) return false;
+    if (!(Number(info.steps) >= Number(info.afterSteps))) return false;
+    if (info.nudged === true) return false;
+    if (info.sentOrPending === true) return false;
+    if (info.turnMatches !== true) return false;
+    return true;
+  }
+
+  function stepNudgeOnToolStepV2(key, sessionId, turnStart) {
+    const c = stepNudgeCfgV2();
+    if (!c.enabled || !key || !sessionId || !turnStart) return;
+    const entry = stepNudgeStateV2.get(sessionId);
+    if (!entry) return;
+    entry.steps += 1;
+    const info = {
+      enabled: c.enabled,
+      steps: entry.steps,
+      afterSteps: c.afterSteps,
+      nudged: entry.nudged,
+      sentOrPending: sendToolSucceededSessions.has(sessionId) || (pendingSendToolCalls.get(sessionId)?.size ?? 0) > 0,
+      turnMatches: entry.turnStart === turnStart
+    };
+    if (!stepNudgeDueV2(info)) return; // turn 已换代 / 步数没够 / 已经发过消息 / nudge 过：都不补
+    entry.nudged = true;
+    setTimeout(() => {
+      try {
+        // 2 秒宽限后复核：回合还是这一代、依然没发、会话还活着才补 nudge
+        if (v2TurnStartAt.get(sessionId) !== turnStart) return;
+        if (sendToolSucceededSessions.has(sessionId) || (pendingSendToolCalls.get(sessionId)?.size ?? 0) > 0) return;
+        if (!collectors.has(sessionId)) return;
+        if (!isCurrentSession(key, sessionId) && !isAuxSessionV2(key, sessionId)) return;
+        if (peakQuietAppliesV2(key)) return;
+        log(`[省步] ${key} 回合内已走 ${entry.steps} 步还没发消息，queue 一句收尾 nudge`);
+        appendActivity(`${key} 省步 nudge（${entry.steps} 步未发）`);
+        api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: STEP_NUDGE_TEXT_V2 }] })
+          .catch((error) => log('[省步] nudge 投递失败:', error?.message ?? error));
+      } catch (error) {
+        log('[省步] nudge 异常:', error?.message ?? error);
+      }
+    }, 2000).unref?.();
   }
 
   // ── 真人式分条发送 ──────────────────────────────────────────────────────
@@ -11781,14 +11843,21 @@ async function main() {
               const hasToolUse = Array.isArray(blocks) && blocks.some(
                 (b) => b?.type === 'tool_use' || b?.type === 'tool-call' || b?.type === 'tool_call'
               );
-              if (hasToolUse) v2TurnIdleAt.delete(frame.sessionId);
-              else v2TurnIdleAt.set(frame.sessionId, Date.now());
+              if (hasToolUse) {
+                v2TurnIdleAt.delete(frame.sessionId);
+                // [省步] 这是一条「带工具调用的步」：计数，够数且没发过消息就准备 nudge
+                try { stepNudgeOnToolStepV2(key, frame.sessionId, v2TurnStartAt.get(frame.sessionId) ?? 0); } catch { /* 不影响主流程 */ }
+              } else {
+                v2TurnIdleAt.set(frame.sessionId, Date.now());
+              }
             }
             // 只有“发送成功”才跳过自动转发；如果工具调用失败，仍允许 AI 的文本正常发出。
             if (frame.event.type === 'turn/start') {
               sendToolSucceededSessions.delete(frame.sessionId);
               pendingSendToolCalls.delete(frame.sessionId);
               v2TurnStartAt.set(frame.sessionId, Date.now());
+              // [省步] 新一代回合：步数计数归零
+              stepNudgeStateV2.set(frame.sessionId, { turnStart: v2TurnStartAt.get(frame.sessionId), steps: 0, nudged: false });
               // [patch 长思考先说一句] 有人刚找过她时，想太久就先垫一句，别让人干等。
               armThinkingFillerV2(key, frame.sessionId, v2TurnStartAt.get(frame.sessionId));
               { const stT = getSocialV2State(key); if (stT) { stT.turnCount = (Number(stT.turnCount) || 0) + 1; stT.turnSentCount = 0; } }
@@ -11858,6 +11927,7 @@ async function main() {
                 v2TurnStartAt.delete(frame.sessionId);
                 clearThinkingFillerV2(frame.sessionId);
                 v2TurnIdleAt.delete(frame.sessionId);
+                stepNudgeStateV2.delete(frame.sessionId);
                 collectors.delete(frame.sessionId);
                 sendToolSucceededSessions.delete(frame.sessionId);
                 pendingSendToolCalls.delete(frame.sessionId);
@@ -11913,6 +11983,7 @@ async function main() {
               v2TurnStartAt.delete(frame.sessionId);
               clearThinkingFillerV2(frame.sessionId);
               v2TurnIdleAt.delete(frame.sessionId);
+              stepNudgeStateV2.delete(frame.sessionId);
               collectors.delete(frame.sessionId);
               // [长记忆] 回合收尾顺手把本轮新消息里的事实提炼进库（本地 SQLite，零模型调用）
               try { autoLearnMemoryV2(key); } catch { /* 记忆失败不影响收发 */ }
