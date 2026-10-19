@@ -74,3 +74,34 @@ export function diffBiliFollowsV2(follows, stateMap, results) {
   }
   return { updates, state, seeded };
 }
+
+// ── [成本感知 2026-10-19] ─────────────────────────────────────────────────────
+// DeepSeek 官方峰谷价（deepseek-flash，2026-10 现价，元/百万 token）：
+//   高峰（工作日 9-12、14-18）：缓存命中 0.04 / 未命中 2 / 输出 8
+//   空闲（其余，含周末节假日）：命中 0.02 / 未命中 1 / 输出 4
+// 纯函数放这里：账本汇总（spendTodayV2）和单测都要用同一套价，改价只改一处。
+const DS_PRICE_PEAK = { hit: 0.04, miss: 2, out: 8 };
+const DS_PRICE_OFFPEAK = { hit: 0.02, miss: 1, out: 4 };
+
+/** 按北京时间判断是否高峰时段（工作日 9-12 / 14-18，不含节假日——按普通周末即可）。 */
+export function isDeepSeekPeak(ts) {
+  const d = new Date(ts + 8 * 3600000); // UTC+8
+  const day = d.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  const h = d.getUTCHours();
+  return (h >= 9 && h < 12) || (h >= 14 && h < 18);
+}
+
+/**
+ * 一条 token 用量记录的人民币成本（元）。
+ * @param {Object} b { cacheMiss, cacheHit, cacheWrite, output, reasoning }
+ * @param {number} ts 该条的时间戳（ms）——峰谷价按它算
+ */
+export function deepseekCostYuan(b, ts) {
+  const p = isDeepSeekPeak(ts) ? DS_PRICE_PEAK : DS_PRICE_OFFPEAK;
+  const hit = Math.max(0, Number(b?.cacheHit) || 0);
+  const cw = Math.max(0, Number(b?.cacheWrite) || 0); // 首次写入按 miss 全价
+  const miss = Math.max(0, Number(b?.cacheMiss) || 0);
+  const out = Math.max(0, Number(b?.output) || 0) + Math.max(0, Number(b?.reasoning) || 0);
+  return (hit * p.hit + cw * p.miss + miss * p.miss + out * p.out) / 1e6;
+}

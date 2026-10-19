@@ -48,7 +48,7 @@ import { createLongMemory, localDayString } from './long-memory.js';
 import { createConsoleServer } from './console-server.js';
 import { createWakePrompt } from './wake-prompt.js';
 import { createSocialState } from './social-state.js';
-import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays, diffBiliFollowsV2 } from './social-mechanisms.js';
+import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays, diffBiliFollowsV2, deepseekCostYuan } from './social-mechanisms.js';
 import { createBili } from './bilibili-lib.js';
 import {
   loadSlang,
@@ -7159,6 +7159,157 @@ async function main() {
     }).catch((error) => log('[追更] 检查异常:', error?.message ?? error));
   }
 
+  // ── [养鱼·评论区互动 2026-10-19] ─────────────────────────────────────────────
+  // 她发的评论有人回了，让她知道并决定要不要回帖。台账在 state/bili-comment-watch.json
+  // （MCP 发评论成功时追加），桥接只读账号 mid + 用只读客户端复查回复数，不需要 cookie。
+  function biliReplyCfgV2() {
+    const c = cfg.socialV2?.biliReply && typeof cfg.socialV2.biliReply === 'object' ? cfg.socialV2.biliReply : {};
+    return {
+      enabled: c.enabled !== false,
+      minHour: Math.min(23, Math.max(0, Number.isFinite(Number(c.minHour)) ? Number(c.minHour) : 19)),
+      maxHour: Math.min(23, Math.max(0, Number.isFinite(Number(c.maxHour)) ? Number(c.maxHour) : 23)),
+      checksPerDay: Math.min(6, Math.max(1, Number(c.checksPerDay ?? 2)))
+    };
+  }
+  function biliAccountMidV2() {
+    try {
+      const a = readJsonSafe(path.join(ROOT, 'state', 'bili-account.json'), null);
+      return String(a?.DedeUserID || '').replace(/\D/g, '');
+    } catch { return ''; }
+  }
+  function biliReplyTickV2() {
+    const c = biliReplyCfgV2();
+    if (!c.enabled || currentMode !== 'reserved2' || socialV2.paused) return;
+    const ownerKey = 'private:' + String(cfg.ownerQQ ?? '');
+    const st = socialV2.conversations.get(ownerKey);
+    if (!st) return;
+    const myMid = biliAccountMidV2();
+    if (!myMid) return; // 还没接账号，谈不上收到回复
+    const hour = new Date().getHours();
+    if (hour < c.minHour || hour > c.maxHour) return;
+    const today = localDayString(0);
+    if (!st.biliReplyCheck || st.biliReplyCheck.day !== today) st.biliReplyCheck = { day: today, checks: 0, done: false };
+    if (st.biliReplyCheck.done || st.biliReplyCheck.checks >= c.checksPerDay) return;
+    const watch = readJsonSafe(path.join(ROOT, 'state', 'bili-comment-watch.json'), { entries: [] });
+    const entries = Array.isArray(watch?.entries) ? watch.entries.filter((e) => e && e.myRpid && (e.bvid || e.aid)) : [];
+    if (!entries.length) return;
+    st.biliReplyCheck.checks += 1;
+    const now = Date.now();
+    const toCheck = entries.filter((e) => !Number(e.lastCheckedAt) || now - Number(e.lastCheckedAt) > 6 * 3600000);
+    if (!toCheck.length) return;
+    Promise.all(toCheck.map(async (e) => {
+      try {
+        const input = e.bvid || String(e.aid);
+        const mine = await biliClientV2().myComments(input, myMid);
+        const cur = mine.comments.find((x) => x.rpid === e.myRpid) || mine.comments[0];
+        if (!cur) { e.lastCheckedAt = now; return null; } // 评论区翻不到了，下次再说
+        const prevN = Number(e.myRcount) || 0;
+        e.myRcount = cur.rcount;
+        e.lastCheckedAt = now;
+        if (cur.rcount > prevN) {
+          const reps = await biliClientV2().commentReplies(input, cur.rpid).catch(() => ({ replies: [] }));
+          return {
+            title: e.title || mine.title || '(视频)',
+            bvid: e.bvid || mine.bvid || '',
+            myText: cur.text,
+            newReplies: (reps.replies || []).slice(-5)
+          };
+        }
+        return null;
+      } catch (error) {
+        log(`[评论区] 复查 ${e.bvid || e.aid} 失败：${error?.message ?? error}`);
+        e.lastCheckedAt = now;
+        return null;
+      }
+    })).then((results) => {
+      try { fs.writeFileSync(path.join(ROOT, 'state', 'bili-comment-watch.json'), JSON.stringify(watch)); } catch { /* 台账写不进去就算了 */ }
+      const hits = results.filter(Boolean);
+      if (!hits.length) { saveSocialV2State(); return; }
+      st.biliReplyCheck.done = true;
+      socialV2.pendingBiliReply = { at: Date.now(), items: hits };
+      saveSocialV2State();
+      log(`[评论区] ${hits.length} 条评论有新回复，安排她来看`);
+      appendActivity(`${ownerKey} [养鱼] 评论区有新回复：${hits.map((h) => h.title).slice(0, 2).join('、')}`);
+      try { scheduleWakeV2(ownerKey, 'biliReply'); } catch (error) { log('[评论区] 调度失败:', error?.message ?? error); }
+    }).catch((error) => log('[评论区] 检查异常:', error?.message ?? error));
+  }
+
+  // ── [群友生日 2026-10-19] ────────────────────────────────────────────────────
+  // 印象档案里记过生日的群友，当天在群里主动祝寿。防重标记 birthdayDoneV2 挂在会话状态上
+  // （印象对象更新会整体重建，不能挂那儿），每年一条，封顶 60 条自动裁。
+  function birthdayWakeTickV2() {
+    if (currentMode !== 'reserved2' || socialV2.paused) return;
+    const today = localDayString(0);
+    for (const [key, st] of socialV2.conversations.entries()) {
+      if (!key.startsWith('group:') || !isSessionAllowedInCurrentMode(key)) continue;
+      const imps = st.memberImpressions;
+      if (!imps || typeof imps !== 'object') continue;
+      if (!Array.isArray(st.birthdayDoneV2)) st.birthdayDoneV2 = {};
+      const doneMap = st.birthdayDoneV2;
+      const names = Object.keys(doneMap);
+      if (names.length > 60) { for (const k of names.slice(0, names.length - 60)) delete doneMap[k]; }
+      const todayList = [];
+      for (const [name, im] of Object.entries(imps)) {
+        if (!im?.birthday) continue;
+        try { if (daysUntilBirthdayV2(im.birthday) !== 0) continue; } catch { continue; }
+        if (doneMap[`${name}:${today}`]) continue;
+        todayList.push({ name, birthday: im.birthday });
+      }
+      if (!todayList.length) continue;
+      for (const p of todayList) doneMap[`${p.name}:${today}`] = true;
+      saveSocialV2State();
+      socialV2.pendingBirthdayV2 = { key, at: Date.now(), items: todayList };
+      log(`[生日] ${key} 今天有 ${todayList.length} 位群友生日：${todayList.map((p) => p.name).join('、')}`);
+      appendActivity(`${key} [拟人] 群友生日：${todayList.map((p) => p.name).join('、')}`);
+      try { scheduleWakeV2(key, 'birthday'); } catch (error) { log(`[生日] 调度失败 ${key}:`, error?.message ?? error); }
+    }
+  }
+
+  // ── [成本感知 2026-10-19] ────────────────────────────────────────────────────
+  // 「她知道自己穷」：把当天的真实开销（token-usage.jsonl 按峰谷价现算）折成一句水位提示，
+  // 快超预算时提醒她收着点，严重超支时主动行为全停。省钱从主人管她变成她自觉。
+  function spendAwareCfgV2() {
+    const c = cfg.socialV2?.spendAware && typeof cfg.socialV2.spendAware === 'object' ? cfg.socialV2.spendAware : {};
+    return {
+      enabled: c.enabled !== false,
+      dailyBudgetYuan: Math.max(0.5, Number(c.dailyBudgetYuan) > 0 ? Number(c.dailyBudgetYuan) : 5)
+    };
+  }
+  let spendCacheV2 = { day: '', at: 0, yuan: 0 };
+  function spendTodayV2() {
+    const c = spendAwareCfgV2();
+    if (!c.enabled) return 0;
+    const now = Date.now();
+    const today = localDayString(0);
+    if (spendCacheV2.day === today && now - spendCacheV2.at < 5 * 60000) return spendCacheV2.yuan;
+    let yuan = 0;
+    try {
+      const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+      const lines = fs.readFileSync(path.join(ROOT, 'state', 'token-usage.jsonl'), 'utf8').split('\n');
+      for (const line of lines) {
+        if (!line || line.length < 20) continue;
+        let j = null;
+        try { j = JSON.parse(line); } catch { continue; }
+        if (j?.model !== 'deepseek-flash' || !Number(j.t) || j.t < dayStart.getTime()) continue;
+        yuan += deepseekCostYuan(j.b, j.t);
+      }
+    } catch { /* 账本读不到就当 0，别因为省钱功能把唤醒搞挂 */ }
+    spendCacheV2 = { day: today, at: now, yuan };
+    return yuan;
+  }
+  function spendLineV2() {
+    const c = spendAwareCfgV2();
+    if (!c.enabled) return '';
+    const yuan = spendTodayV2();
+    const ratio = yuan / c.dailyBudgetYuan;
+    if (ratio < 0.8) return ''; // 没到警戒线一个字都不多说，这句本身也是钱
+    const used = yuan.toFixed(2);
+    if (ratio > 1.2) {
+      return `【今天超支】今天的 API 开销已经 ${used} 元（预算 ${c.dailyBudgetYuan} 元）：主动找话题/冒泡的机会全放弃，只回别人直接找你的话，回完立刻 qq_set_wake_config 收尾，别拖回合。明天再正常。\n\n`;
+    }
+    return `【今天花得不少】今天的 API 开销已经 ${used} 元（预算 ${c.dailyBudgetYuan} 元）：说话再收着点——少闲聊、回合快收尾，别为了「确认」多跑工具步。\n\n`;
+  }
+
   // ── [长记忆 2026-10-18] 自动提炼 + 定期整理 ─────────────────────────────────
   // 背景：库里 8052 条消息只长出 24 条 facts（几乎全靠她现场调工具写），会话又是每轮新开，
   // 所以她「不记得上周聊过什么」。这里每轮结束从新消息里规则式提炼几条事实入库（零模型调用），
@@ -9505,6 +9656,7 @@ async function main() {
     grumpSignalsV2,
     historyRecallV2,
     sleepToneLineV2,
+    spendLineV2,
     log,
     looksLikeUnfinished,
     longMemoryRecallV2,
@@ -10623,6 +10775,10 @@ async function main() {
     try { biliStrollTickV2(); } catch (error) { log(`[巡园] tick 异常：${error?.message ?? error}`); }
     // [养鱼·追更] 关注的 UP 主有没有更新（只读 API，空闲时段窗口内一天最多查几次）。
     try { biliFollowTickV2(); } catch (error) { log(`[追更] tick 异常：${error?.message ?? error}`); }
+    // [养鱼·评论区] 她发的评论有没有收到新回复（同样只读，搭同一只 tick）。
+    try { biliReplyTickV2(); } catch (error) { log(`[评论区] tick 异常：${error?.message ?? error}`); }
+    // [群友生日] 印象档案里记过生日的人，今天生日的主动祝寿。
+    try { birthdayWakeTickV2(); } catch (error) { log(`[生日] tick 异常：${error?.message ?? error}`); }
     for (const key of socialV2.conversations.keys()) {
       if (!isSessionAllowedInCurrentMode(key)) continue;
       const st = socialV2.conversations.get(key);
@@ -11109,6 +11265,11 @@ async function main() {
     biliStroll: 44,
     // [养鱼·追更] UP 更新安利：比巡园略高一点（新投稿有时效性，隔天就成旧闻了），仍给真人让路。
     biliFollow: 46,
+    // [养鱼·评论区] 自己的评论收到回复：和追更同族（有时效），但不必急着回，让它一位。
+    biliReply: 47,
+    // [群友生日] 当天生日祝寿：是「欠着的人情」，比播报高——错过当天再祝就不是那回事了；
+    // 但仍是锦上添花，有人在真叫她就让人先说。
+    birthday: 58,
     replyCheck: 40,
     timeout: 30,
     proactiveCheck: 20,

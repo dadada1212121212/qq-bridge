@@ -99,7 +99,10 @@ export function createSocialState(S) {
         // [养鱼·追更] 关注的 UP 主最新投稿水位 { [mid]: { name, lastBvid, lastTitle, lastPubdate, seeded } }。
         biliFollowState: {},
         // [养鱼·追更] 当天检查判重 { day, checks, done }：一天最多查 checksPerDay 次、安利一轮。
-        biliFollowCheck: null
+        biliFollowCheck: null,
+        // [群友生日] 今年已祝过寿的标记 { [`${name}:${day}`]: true }——印象对象更新时会整体
+        // 重建，防重标记不能挂在 impression 上，单独存（封顶 60 条，按写入序裁）。
+        birthdayDoneV2: {}
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
@@ -251,7 +254,20 @@ export function createSocialState(S) {
             biliFollowCheck: (val.biliFollowCheck && typeof val.biliFollowCheck === 'object'
               && /^\d{4}-\d{2}-\d{2}$/.test(String(val.biliFollowCheck.day || '')))
               ? { day: String(val.biliFollowCheck.day), checks: Number(val.biliFollowCheck.checks) || 0, done: val.biliFollowCheck.done === true }
-              : null
+              : null,
+            // [群友生日] 防重标记归一化：只留合法键，封顶 60 条。
+            birthdayDoneV2: (() => {
+              const raw = (val.birthdayDoneV2 && typeof val.birthdayDoneV2 === 'object') ? val.birthdayDoneV2 : {};
+              const clean = {};
+              let n = 0;
+              for (const [k, v] of Object.entries(raw)) {
+                if (n >= 60) break;
+                if (!/^.+:\d{4}-\d{2}-\d{2}$/.test(k) || v !== true) continue;
+                if (['__proto__', 'constructor', 'prototype'].includes(k.split(':')[0])) continue;
+                clean[k] = true; n++;
+              }
+              return clean;
+            })()
           };
           // 旧状态/异常状态里的指定成员名单也统一归一化，防止“null”/非法值污染。
           if (st.wakeConfig?.triggers && typeof st.wakeConfig.triggers === 'object') {
@@ -370,7 +386,8 @@ export function createSocialState(S) {
           lastBiliStrollDay: String(st.lastBiliStrollDay || ''),
           // [养鱼·追更] 水位跨重启保留（lastBvid 判新就靠它）。
           biliFollowState: st.biliFollowState && typeof st.biliFollowState === 'object' ? st.biliFollowState : {},
-          biliFollowCheck: st.biliFollowCheck && typeof st.biliFollowCheck === 'object' ? st.biliFollowCheck : null
+          biliFollowCheck: st.biliFollowCheck && typeof st.biliFollowCheck === 'object' ? st.biliFollowCheck : null,
+          birthdayDoneV2: st.birthdayDoneV2 && typeof st.birthdayDoneV2 === 'object' ? st.birthdayDoneV2 : {}
         };
       }
       atomicWriteJson(SOCIAL_V2_FILE, obj);

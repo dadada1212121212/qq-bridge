@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays, diffBiliFollowsV2 } from '../src/social-mechanisms.js';
+import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays, diffBiliFollowsV2, deepseekCostYuan, isDeepSeekPeak } from '../src/social-mechanisms.js';
 import { createLongMemory } from '../src/long-memory.js';
 
 let passed = 0;
@@ -133,3 +133,33 @@ ok('diffBiliFollows：results 传普通对象也行', () => {
 });
 
 console.log(`test-social-mechanisms: ${passed} 断言通过${process.exitCode ? '（存在失败）' : ''}`);
+
+// ── [成本感知] deepseekCostYuan 峰谷计价 ──────────────────────────────────────
+// 周二 10:00（北京）= 高峰；周六 10:00 = 空闲；工作日 20:00 = 空闲。
+const PEAK_TS = Date.parse('2026-10-20T10:00:00+08:00');
+const WEEKEND_TS = Date.parse('2026-10-24T10:00:00+08:00');
+const NIGHT_TS = Date.parse('2026-10-20T20:00:00+08:00');
+ok('峰谷判定：工作日白天高峰 / 周末和晚上空闲', () => {
+  assert.equal(isDeepSeekPeak(PEAK_TS), true);
+  assert.equal(isDeepSeekPeak(WEEKEND_TS), false);
+  assert.equal(isDeepSeekPeak(NIGHT_TS), false);
+});
+ok('计价：高峰全价命中是空闲的一半', () => {
+  const b = { cacheHit: 1000000, cacheMiss: 0, cacheWrite: 0, output: 0 };
+  const peak = deepseekCostYuan(b, PEAK_TS);
+  const off = deepseekCostYuan(b, NIGHT_TS);
+  assert.equal(peak, 0.04);
+  assert.equal(off, 0.02);
+  assert.equal(peak / off, 2);
+});
+ok('计价：cacheWrite 按 miss 全价、reasoning 算输出', () => {
+  const b = { cacheHit: 0, cacheMiss: 1000000, cacheWrite: 1000000, output: 1000000, reasoning: 1000000 };
+  // 高峰：1M miss×2 + 1M cw×2 + 2M out×8 = 20 元
+  assert.equal(deepseekCostYuan(b, PEAK_TS), 20);
+});
+ok('计价：脏数据（负数/缺字段）不炸', () => {
+  assert.equal(deepseekCostYuan({ cacheHit: -5 }, PEAK_TS), 0);
+  assert.equal(deepseekCostYuan(null, PEAK_TS), 0);
+});
+
+console.log(`test-social-mechanisms（含计价）: ${passed} 断言通过${process.exitCode ? '（存在失败）' : ''}`);

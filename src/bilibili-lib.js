@@ -334,7 +334,10 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
   }
 
   /** 以她的名义发一条评论（频控内）。input 支持 BV/av/链接。 */
-  async function postComment(input, message) {
+  // [养鱼·评论区互动 2026-10-19] 以她的名义发评论（频控内）。
+  // input 支持 BV/av/链接；opts.root = 要回复的评论 rpid（给别人评论盖楼用）。
+  // 回复场景豁免「同视频只动一次」（在自己评论底下跟帖是正常人行为），但仍占每日评论额度。
+  async function postComment(input, message, opts = {}) {
     const text = String(message || '').replace(/\s+/g, ' ').trim();
     if (!text) throw new Error('评论内容是空的');
     if (text.length > 500) throw new Error('评论太长（B 站上限约 500 字），说短点');
@@ -342,10 +345,12 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
     if (!id) throw new Error('认不出视频标识：给 BV 号、av 号或 bilibili 视频链接');
     const v = await biliGet(`/x/web-interface/view?${id.bvid ? `bvid=${id.bvid}` : `aid=${id.aid}`}`);
     const q = loadQuota();
-    quotaCheckVideoOnce(q, v.aid);
+    const rootRpid = String(opts.root || '').replace(/\D/g, '');
+    if (!rootRpid) quotaCheckVideoOnce(q, v.aid); // 盖楼回复不限「同视频一次」，顶层评论才限
     quotaTake(q, 'comments'); // 先占额度：写入失败也不返还，比超发安全
     const a = await ensureAuth();
     const body = new URLSearchParams({ oid: String(v.aid), type: '1', message: text, plat: '1', csrf: a.biliJct });
+    if (rootRpid) { body.set('root', rootRpid); body.set('parent', rootRpid); }
     const j = await rawJson(`${API}/x/v2/reply/add`, { method: 'POST', body: body.toString(), auth: true });
     if (j?.code !== 0) {
       const human = j?.code === -111 ? 'csrf 失效，重新导 cookie' : j?.code === -509 || j?.code === 12061 ? '触发风控/评论太快，今天先歇了' : j?.message || j?.msg || '未知原因';
@@ -353,8 +358,65 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
       throw new Error(`评论失败（code ${j?.code}）：${human}`);
     }
     saveQuota(q);
-    log(`[bilibili] 已评论 aid=${v.aid}：${text.slice(0, 40)}`);
-    return { ok: true, aid: v.aid, bvid: v.bvid, title: stripEm(v.title), text, url: `https://www.bilibili.com/video/${v.bvid}` };
+    const myRpid = String(j?.data?.rpid || '');
+    log(`[bilibili] 已评论 aid=${v.aid}${rootRpid ? `（回复 ${rootRpid}）` : ''}：${text.slice(0, 40)}`);
+    return { ok: true, aid: v.aid, bvid: v.bvid, title: stripEm(v.title), text, rpid: myRpid, root: rootRpid || undefined, url: `https://www.bilibili.com/video/${v.bvid}` };
+  }
+
+  // ── [养鱼·评论区互动 2026-10-19] 读侧：找到她自己的评论、看别人回了什么 ──────
+  /** 在视频评论区里找「她发的」评论（按账号 mid 匹配，时间序翻前两页）。 */
+  async function myComments(input, myMid) {
+    const id = parseVideoId(input);
+    if (!id) throw new Error('认不出视频标识：给 BV 号、av 号或 bilibili 视频链接');
+    let aid = id.aid;
+    let title = '';
+    if (!aid) {
+      const v = await biliGet(`/x/web-interface/view?bvid=${id.bvid}`);
+      aid = v?.aid;
+      title = stripEm(v?.title || '');
+    }
+    if (!aid) throw new Error('换 aid 失败：B 站接口没给出这个视频的 aid');
+    const midStr = String(myMid || '').replace(/\D/g, '');
+    if (!midStr) throw new Error('没有账号 mid，没法认出哪条是她发的');
+    const found = [];
+    for (let pn = 1; pn <= 2 && found.length < 5; pn++) {
+      // 时间序（sort=0）才翻得到自己的旧评论，热度序会被顶走
+      const d = await biliGet(`/x/v2/reply?type=1&oid=${aid}&pn=${pn}&ps=49&sort=0`);
+      const list = Array.isArray(d?.replies) ? d.replies : [];
+      if (!list.length) break;
+      for (const r of list) {
+        if (String(r?.member?.mid) !== midStr) continue;
+        found.push({
+          rpid: String(r?.rpid || ''),
+          text: stripEm(String(r?.content?.message || '')).slice(0, 120),
+          like: Number(r?.like) || 0,
+          rcount: Number(r?.rcount) || 0,
+          ctime: Number(r?.ctime) || 0
+        });
+      }
+    }
+    return { aid, bvid: id.bvid || '', title, comments: found };
+  }
+
+  /** 拉某条评论（rootRpid）楼里的回复，第一页最新 20 条。 */
+  async function commentReplies(input, rootRpid) {
+    const id = parseVideoId(input);
+    if (!id) throw new Error('认不出视频标识：给 BV 号、av 号或 bilibili 视频链接');
+    let aid = id.aid;
+    if (!aid) {
+      const v = await biliGet(`/x/web-interface/view?bvid=${id.bvid}`);
+      aid = v?.aid;
+    }
+    const root = String(rootRpid || '').replace(/\D/g, '');
+    if (!aid || !root) throw new Error('需要视频标识和楼中楼的 rpid');
+    const d = await biliGet(`/x/v2/reply/reply?type=1&oid=${aid}&root=${root}&pn=1&ps=20&sort=0`);
+    const out = (Array.isArray(d?.replies) ? d.replies : []).map((r) => ({
+      rpid: String(r?.rpid || ''),
+      user: stripEm(r?.member?.uname || '?'),
+      text: stripEm(String(r?.content?.message || '')).slice(0, 120),
+      ctime: Number(r?.ctime) || 0
+    }));
+    return { aid, root, replies: out, total: String(d?.page?.count || out.length) };
   }
 
   /** 点赞（频控内）。 */
@@ -391,7 +453,7 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
 
   return {
     search, videoInfo, popular, userInfo, comments, userVideos, animeSearch,
-    postComment, likeVideo, coinVideo, me,
+    postComment, likeVideo, coinVideo, me, myComments, commentReplies,
     _internal: { getBuvid3, getWbiKeys, biliGet, setAuthLoader, ensureAuth, setQuotaFile, loadQuota }
   };
 }

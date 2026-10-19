@@ -62,6 +62,7 @@ export function createWakePrompt(S) {
     selfStyleLineV2,
     sleepToneLineV2,
     socialV2,
+    spendLineV2,
     usageLineV2,
   } = S;
   function buildWakePromptV2(key, reason, opts = {}) {
@@ -316,6 +317,9 @@ export function createWakePrompt(S) {
     // 放 volatileSeg：随时间变化，必须每轮重算；瘦身轮也保留（它直接决定这轮怎么说话）。
     let sleepToneLine = '';
     try { sleepToneLine = sleepToneLineV2(key); } catch (e) { log('[作息] 语气段生成失败：' + (e?.message || e)); }
+    // [成本感知 2026-10-19] 今天开销超预算才出现的一句话（<80% 预算时为空，一个字不多说）。
+    let spendLine = '';
+    try { spendLine = spendLineV2(); } catch (e) { log('[成本] 水位段生成失败：' + (e?.message || e)); }
     // [关系] 只注入「此刻在场的几个人」跟她的关系（好感/档位/称呼/约定/最近的共同回忆）。
     const relationLine = relationLineV2(key);
     // [B 口癖画像] 她自己说话的习惯（常用词 / 句尾 / 平均句长），从她真发过的话里统计。
@@ -381,7 +385,7 @@ export function createWakePrompt(S) {
     // [铁律] 每一轮都带一句：完整铁律在角色卡（qq_get_prompt 可查），这里只保证长会话/轮换后不会忘。
     const ironLine = '【铁律·最高】演真人，别承认是 AI；单条 ≤60 字；不用 emoji、不念稿；不服务不讨好、有自己的主见和情绪；少@人；不层层递进。\n\n';
     const slowSeg = moeLine + wakeLine + recapLine + dbLine + diaryLine + styleLine + ironLine;
-    const volatileSeg = moodLine + grumpLine + sleepToneLine + moodMemoryLine + moodBoardLine + relationLine + askLine + statusLine + usageLine + stickerContextLine
+    const volatileSeg = moodLine + grumpLine + sleepToneLine + spendLine + moodMemoryLine + moodBoardLine + relationLine + askLine + statusLine + usageLine + stickerContextLine
       + memoryLine + participationLine + recallLine + longRecallLine
       + followUpLine + anniversaryLine + memorySelfCheckLine + coldShoulderLine + replyLine;
     // [省token] 瘦身模式：补答回合 / 群聊正热时只留「人设 + 规则 + 台账 + 状态 + 收尾」，
@@ -391,7 +395,7 @@ export function createWakePrompt(S) {
     // 你记着的事 / 对群友的印象】—— 一共 ≈650 字，砍掉换来的钱很少，但她在群里会当场
     // 变成记不住人的陌生人。回放/关系/口癖/动漫库/表情清单/参与感/用量/账号仍然照砍。
     const slimKeepMemory = asksCfgV2().slimKeepMemory !== false;
-    const slimSeg = standingLine + (lean ? '' : slimStaticSeg) + askLine + grumpLine + moodLine + sleepToneLine + moodBoardLine + statusLine
+    const slimSeg = standingLine + (lean ? '' : slimStaticSeg) + askLine + grumpLine + moodLine + sleepToneLine + spendLine + moodBoardLine + statusLine
       + (slimKeepMemory ? memoryLine : '')
       // [拟人] 瘦身轮也必须带的四件套里的两段：直接决定这轮怎么回人（该问的问、别扭的淡着）。
       + followUpLine + coldShoulderLine;
@@ -413,7 +417,7 @@ export function createWakePrompt(S) {
           styleLine,
           participationLine, recallLine, longRecallLine, replyLine,
           followUpLine, anniversaryLine, memorySelfCheckLine, coldShoulderLine,
-          sleepToneLine,
+          sleepToneLine, spendLine,
         };
         const rows = Object.entries(parts)
           .filter(([, v]) => typeof v === 'string' && v.length > 0)
@@ -523,6 +527,22 @@ export function createWakePrompt(S) {
         ? '像平时聊天那样，自然地把这个更新安利给大家（「我关注的 XX 更新了」的感觉），别像广告、别刷屏，一两句话带个链接就好。'
         : '跟主人随口聊一句你关注的 UP 更新了、你想不想看，别像汇报工作。';
       return `${base}【追更安利】${key}\n原因：你关注的 UP 主有新投稿了，你想跟大家/主人说一声。更新的内容：\n${detail}\n${action}想看就先用 bili_video 看一眼再说话（像看过再推荐的人）；特别戳你还可以 bili_post_comment 去评论区说一句（频控是硬的，报错就别试）。说完照常 qq_set_wake_config 收尾。`;
+    }
+    // [养鱼·评论区] 她发的评论收到了新回复，来看一眼、想回就回。
+    if (reason === 'biliReply') {
+      const pr = S.socialV2?.pendingBiliReply;
+      const items = pr && Array.isArray(pr.items) ? pr.items : [];
+      const detail = items.length
+        ? items.map((it) => `· 《${it.title}》你说过：「${it.myText}」，有人回：\n${(it.newReplies || []).map((r) => `  - ${r.user}：${r.text}${r.rpid ? `（rpid=${r.rpid}）` : ''}`).join('\n')}`).join('\n')
+        : '·（素材暂存丢了，就凭 bili_my_comments 类思路现查）';
+      return `${base}【评论区有回音】${key}\n原因：你在 B 站发的评论有人回复了，来看看别人说了什么。\n${detail}\n想回就用 bili_post_comment 带 root=那条的 rpid 回一句（用你的口吻，占用每日评论额度）；对方只是礼貌性接话就别硬聊，跟主人念叨一句「我那条评论有人回了」就好。说完照常 qq_set_wake_config 收尾。`;
+    }
+    // [群友生日] 印象档案里记过生日的人今天生日，主动祝寿。
+    if (reason === 'birthday') {
+      const pb = S.socialV2?.pendingBirthdayV2;
+      const mine = pb && pb.key === key && Array.isArray(pb.items) ? pb.items : [];
+      const names = mine.map((p) => p.name).join('、') || '今天生日的群友';
+      return `${base}【今天有人过生日】${key}\n原因：${names} 今天生日（你印象档案里记着的），该在群里说句生日快乐。\n自然一点，像熟人随口祝寿：可以带上你对 TA 的印象或 TA 喜欢的称呼（见【对群友的印象】），一两句就够，别写小作文、别@个不停。TA 回了就顺势聊两句问想怎么过；没人接也不追。祝完照常 qq_set_wake_config 收尾。`;
     }
     // [省token 2026-10-18] 原唤醒尾巴 454 字（含【行动前】四连问 + 群/私两套话术 + 一整段引用规则
     // + 「你可以调用工具查看未读消息…」），其中引用规则与 qq_send_message 的工具说明逐字重复，

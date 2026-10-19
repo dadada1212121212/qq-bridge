@@ -37,6 +37,26 @@ function accountConfigured() {
   } catch { return false; }
 }
 
+// [养鱼·评论区互动 2026-10-19] 她发过的顶层评论台账：MCP 只在发评论成功时追加，
+// 桥接的 biliReplyTickV2 定期回来看有没有人回复（并回写 myRcount / lastCheckedAt）。
+// 格式：{ entries: [{ aid, bvid, title, myRpid, myRcount, at, lastCheckedAt? }] }，上限 30 条。
+const WATCH_FILE = path.join(REPO_ROOT, 'state', 'bili-comment-watch.json');
+function loadWatch() {
+  try {
+    const j = JSON.parse(fs.readFileSync(WATCH_FILE, 'utf8'));
+    if (Array.isArray(j?.entries)) return j;
+  } catch { /* 新文件 */ }
+  return { entries: [] };
+}
+function recordWatch(entry) {
+  try {
+    const w = loadWatch();
+    if (!w.entries.some((e) => e.aid === entry.aid && e.myRpid === entry.myRpid)) w.entries.push(entry);
+    if (w.entries.length > 30) w.entries = w.entries.slice(-30);
+    fs.writeFileSync(WATCH_FILE, JSON.stringify(w));
+  } catch (e) { console.error('[bilibili] watch 台账写入失败:', e?.message || e); }
+}
+
 const server = new McpServer({ name: 'bilibili-safe', version: '0.1.0' });
 
 server.tool(
@@ -197,18 +217,21 @@ server.tool(
 
 server.tool(
   'bili_post_comment',
-  '以肥鱼号身份在 B 站视频下发一条评论。**先用你自己的口吻写**（你是蓝色大肥鱼，评论也要像你），别复制别人的、别引战辱骂。硬频控：每天 5 条、同类间隔 30 分钟、同视频只评一次。',
+  '以肥鱼号身份在 B 站视频下发一条评论。**先用你自己的口吻写**（你是蓝色大肥鱼，评论也要像你），别复制别人的、别引战辱骂。硬频控：每天 5 条、同类间隔 30 分钟、同视频只评一次。要回复别人的评论（比如你的评论收到了回复）时传 root=那条评论的 rpid，这时不限「同视频一次」但仍占每日额度。',
   {
     video: z.string().describe('BV 号、av 号或 bilibili 视频链接'),
-    message: z.string().describe('评论内容（用你的口吻，短句最好，≤500 字）')
+    message: z.string().describe('评论内容（用你的口吻，短句最好，≤500 字）'),
+    root: z.string().optional().describe('要回复的评论 rpid（盖楼回复时传，普通评论不传）')
   },
-  async ({ video, message }) => {
+  async ({ video, message, root }) => {
     if (!accountConfigured()) {
       return { content: [{ type: 'text', text: '【B 站】账号还没接入，发不了评论：请主人导一次登录 cookie 到 state/bili-account.json。' }], isError: true };
     }
     try {
-      const r = await bili.postComment(video, message);
-      return { content: [{ type: 'text', text: `【B 站】评论已发出（${r.title}）：\n「${r.text}」\n${r.url}` }] };
+      const r = await bili.postComment(video, message, { root });
+      // [评论区互动] 顶层评论记进 watch 台账，桥接会定期回来看有没有人回复。
+      if (r.rpid && !r.root) recordWatch({ aid: r.aid, bvid: r.bvid, title: r.title, myRpid: r.rpid, myRcount: 0, at: Date.now() });
+      return { content: [{ type: 'text', text: `【B 站】评论已发出（${r.title}）：\n「${r.text}」\n${r.url}${r.root ? `\n（这是对 ${r.root} 的楼中楼回复）` : ''}` }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `发评论失败：${error?.message ?? error}` }], isError: true };
     }
