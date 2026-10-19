@@ -494,11 +494,27 @@ export function createConsoleServer(S) {
     }
     /** 请求体里的 key 被误填成令牌时改回真实 key；改了就记一行日志，便于发现提示词回归。 */
     function repairAgentKeyInBody(body, token, where) {
+      if (!body || typeof body !== 'object') return false;
+      let changed = false;
       const fixed = keyFromTokenShaped(body?.key, token);
-      if (!fixed) return false;
-      log(`[patch key 误填] ${where || ''} 的 key 是会话令牌，已按令牌反查为 ${fixed}`);
-      body.key = fixed;
-      return true;
+      if (fixed) {
+        log(`[patch key 误填] ${where || ''} 的 key 是会话令牌，已按令牌反查为 ${fixed}`);
+        body.key = fixed;
+        changed = true;
+      }
+      // [patch key 误填 2026-10-19] 新场景：**整个填反** —— key 填了令牌、token 填了会话 key。
+      // 上面的分支只修 key，token 还是错的（报「未授权：智能体调用必须携带有效的会话令牌」）。
+      // token 位置出现的是合法会话 key 时，直接按 key 反查该会话的真令牌补上（同会话内自愈，不越权）。
+      const tk = String(body?.token ?? '').trim();
+      if (/^(group|private):\d+$/.test(tk)) {
+        const st = socialV2.conversations.get(tk);
+        if (st?.agentToken) {
+          log(`[patch key 误填] ${where || ''} 的 token 填成了会话 key（${tk}），已补回该会话真令牌`);
+          body.token = st.agentToken;
+          changed = true;
+        }
+      }
+      return changed;
     }
     const server = http.createServer(async (req, res) => {
       let url;

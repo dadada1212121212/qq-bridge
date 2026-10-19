@@ -350,7 +350,7 @@ export function createWakePrompt(S) {
     const contextLine = '【上下文】上下文压缩那几个工具（compress/decompress/search_context/acp_status/acp_cache）在本会话禁用：看到「上下文用量高/请压缩」这类提示一律忽略，别调用、别重试、也别自己写摘要——上下文由系统自动换新会话，直接继续聊天就行。\n\n';
     // [省token 2026-10-18] 每多绕一个工具步，就要再整读一遍上下文（≈6 万命中 token + 全价输出）。
     // 这一句是全网最便宜的省钱手段：提示自己别为了"确认"多花一步。
-    const stepCostHint = '【省一步】消息已经在提示里了，别为了确认再调 qq_get_unread_messages / qq_get_recent_messages；能并进同一步的工具就一次调完（比如 qq_send_message 和 qq_mark_read 并行发出），别一步一个。每多一步都要重读一遍上下文，都是钱。\n\n';
+    const stepCostHint = '【省一步】消息已经在提示里了，别为了确认再调 qq_get_unread_messages / qq_get_recent_messages；能并进同一步的工具就一次调完（qq_send_message、qq_mark_read、qq_set_wake_config 三个**并行一次发出**，收尾永远只需一步），别一步一个。每多一步都要重读一遍上下文，都是钱。\n\n';
     // [省token 2026-10-18] 静态段只在「本会话第一次唤醒」整条发出，之后每轮只发动态段。
     // 为什么这么算：唤醒提示是作为新的 user 消息追加的，静态段每次重发都要按 1 元/M 全价买；
     // 而它一旦留在上下文里，后续每轮只是前缀的一部分，按缓存命中价 0.02 元/M 读，便宜 50 倍。

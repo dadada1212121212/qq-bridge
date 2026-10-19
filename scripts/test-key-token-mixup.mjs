@@ -108,5 +108,17 @@ await test('the wake prompt spells out the real conversation key next to the tok
   assert.ok(!reminder.includes('同时填进 key 和 token'));
 });
 
+await test('fully swapped key/token (token in key, key in token) is healed too', async ({ st, request, append }) => {
+  // [patch 2026-10-19] 新场景：key=令牌、token=会话 key 整个填反（实测 qq_get_prompt 报
+  // 「未授权：智能体调用必须携带有效的会话令牌」）。key 反查 + token 按 key 补真令牌。
+  append('swap');
+  const read = await request('unread');
+  const result = await request('wake-config', {
+    key: st.agentToken,
+    body: { config: ACTIVE, throughSeq: read.data.readThroughSeq, token: KEY },
+  });
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+});
+
 console.log(`\n${tests - failures}/${tests} passed`);
 if (failures) process.exitCode = 1;

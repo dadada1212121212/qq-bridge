@@ -60,12 +60,22 @@ server.tool(
 
 server.tool(
   'web_fetch',
-  '只读抓取 HTTP(S) 网页正文，返回纯文本/HTML 前 50000 字符。禁止访问内网/本机地址，不执行任何本地操作。',
+  '只读抓取 HTTP(S) 网页正文，返回纯文本前 8000 字符（超出会截断并注明总长）。禁止访问内网/本机地址，不执行任何本地操作。',
   { url: z.string().describe('要抓取的 http(s) URL') },
   async ({ url }) => {
+    // [省token 2026-10-19] 原实现把整个 safeFetch 结果 JSON.stringify（正文上限 50000 字符）
+    // 直接塞进上下文：一次抓取 = 2.5 万+ token，几轮就把会话撑到退役线（60k），
+    // 下一轮全价重读。查证其实只需要正文开头 —— 8000 字封顶 + 纯文本，砍掉 80%+。
+    const WEB_FETCH_MAX_CHARS = 8000;
     try {
-      const result = await safeFetch(url);
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      const result = await safeFetch(url, WEB_FETCH_MAX_CHARS + 4000);
+      const body = typeof result?.body === 'string' ? result.body : '';
+      const head = body.slice(0, WEB_FETCH_MAX_CHARS);
+      const more = body.length > WEB_FETCH_MAX_CHARS
+        ? `\n…（正文共 ${body.length} 字符，已截断到前 ${WEB_FETCH_MAX_CHARS}。要更多细节就换更具体的来源再 fetch，或用 web_search 拿摘要）`
+        : (result?.truncated ? '\n…（源站响应过长，已按安全上限截断）' : '');
+      const text = `【HTTP ${result?.statusCode ?? '?'}】${result?.url ?? url}\n${head}${more}`;
+      return { content: [{ type: 'text', text }] };
     } catch (error) {
       // 报错也要说人话：DNS 超时/被墙是最常见的一类，直接把"别在同一地址上重试、
       // 换镜像或改用 web_search"写进去，免得她换个 URL 再撞一次。
