@@ -89,7 +89,11 @@ export function createSocialState(S) {
         promises: [],
         memberImpressions: {},
         // [并发] 点名台账：谁在等她回话。跨回合、跨槽位共享，答完才结清。
-        asks: []
+        asks: [],
+        // [拟人四件套] 事件跟进台账 / 对人冷场余波 / 超长记忆自检水位。
+        followUps: [],
+        coldShoulder: {},
+        lastMemorySelfCheckAt: 0
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
@@ -204,7 +208,21 @@ export function createSocialState(S) {
                 clean[k] = v;
               }
               return clean;
-            })()
+            })(),
+            // [拟人四件套] 归一化：followUps 只留结构完整的；coldShoulder 只留数字水位。
+            followUps: Array.isArray(val.followUps)
+              ? val.followUps.filter((f) => f && typeof f === 'object' && String(f.event || '').trim() && Number(f.followUpAt) > 0).slice(-20)
+              : [],
+            coldShoulder: (() => {
+              const rawCs = (val.coldShoulder && typeof val.coldShoulder === 'object') ? val.coldShoulder : {};
+              const clean = {};
+              for (const [k, v] of Object.entries(rawCs)) {
+                if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+                clean[k] = { at: Number(v?.at) || 0, hostile: !!v?.hostile };
+              }
+              return clean;
+            })(),
+            lastMemorySelfCheckAt: Number(val.lastMemorySelfCheckAt) || 0
           };
           // 旧状态/异常状态里的指定成员名单也统一归一化，防止“null”/非法值污染。
           if (st.wakeConfig?.triggers && typeof st.wakeConfig.triggers === 'object') {
@@ -315,7 +333,11 @@ export function createSocialState(S) {
           sleepGraceUntil: Number(st.sleepGraceUntil) || 0,
           pendingWakeReasons: Array.isArray(st.pendingWakeReasons) ? st.pendingWakeReasons.filter((x) => x && typeof x === 'object').slice(-20) : [],
           // [并发] 点名台账跨重启保留：重启后还认得「谁在等她」，不会把人晾在那儿。
-          asks: pruneAsks(st.asks, { cfg: concurrencyCfgV2() })
+          asks: pruneAsks(st.asks, { cfg: concurrencyCfgV2() }),
+          // [拟人四件套] 事件可能好几天后才到期，冷场余波、自检水位同理，都得跨重启。
+          followUps: Array.isArray(st.followUps) ? st.followUps.slice(-20) : [],
+          coldShoulder: st.coldShoulder && typeof st.coldShoulder === 'object' ? st.coldShoulder : {},
+          lastMemorySelfCheckAt: Number(st.lastMemorySelfCheckAt) || 0
         };
       }
       atomicWriteJson(SOCIAL_V2_FILE, obj);

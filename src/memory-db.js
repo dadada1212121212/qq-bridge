@@ -1274,6 +1274,18 @@ export function createMemoryDb({ file, tokenUsageFile = '', log = () => {}, maxF
     }
   }
 
+  // [纪念日 2026-10-19] 会话首条消息时间 + 最熟的前几个人的初见时间 —— 纪念日里程碑的原料。
+  function anniversarySignals(key) {
+    try {
+      const first = db.prepare('SELECT MIN(at) AS t FROM messages WHERE key = ? AND at > 0').get(key);
+      const people = db.prepare("SELECT nickname, first_seen, msg_count FROM people WHERE kind = 'user' AND first_seen > 0 ORDER BY msg_count DESC LIMIT 5").all();
+      return { keyFirstAt: Number(first?.t) || 0, people };
+    } catch (error) {
+      log('anniversarySignals failed', error?.message || error);
+      return { keyFirstAt: 0, people: [] };
+    }
+  }
+
   function recentPeople(limit) {
     try {
       return db.prepare('SELECT id, nickname, relation, msg_count, last_seen FROM people WHERE kind = \'user\' ORDER BY last_seen DESC LIMIT ?').all(Number(limit) || 30);
@@ -1657,6 +1669,7 @@ export function createMemoryDb({ file, tokenUsageFile = '', log = () => {}, maxF
     search,
     daySignals,
     pruneMessages,
+    anniversarySignals,
     recentPeople,
     personIdByName,
     peopleByIds,

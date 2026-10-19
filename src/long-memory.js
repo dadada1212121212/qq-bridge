@@ -243,6 +243,15 @@ export function createLongMemory({ file, log = () => {}, maxSummaryChars = 260 }
     try { return !!stmts.allByKeyDay.get(String(key), String(day)); } catch { return false; }
   }
 
+  // [记忆自检 2026-10-19] 随机抽一条该会话的旧情景，给她当「顺势求证记忆」的素材。
+  function sampleEpisode(key) {
+    try {
+      const rows = stmts.all.all(String(key)).filter((r) => r && r.summary);
+      if (!rows.length) return null;
+      return rows[Math.floor(Math.random() * Math.min(rows.length, 10))];
+    } catch { return null; }
+  }
+
   function lastConsolidateDay() {
     try { return stmts.metaGet.get('lastConsolidateDay')?.v || ''; } catch { return ''; }
   }
@@ -276,7 +285,7 @@ export function createLongMemory({ file, log = () => {}, maxSummaryChars = 260 }
 
   function close() { try { db.close(); } catch { /* */ } }
 
-  return { file, db, consolidateDay, recall, hasEpisode, lastConsolidateDay, setLastConsolidateDay, prune, stats, close };
+  return { file, db, consolidateDay, recall, hasEpisode, sampleEpisode, lastConsolidateDay, setLastConsolidateDay, prune, stats, close };
 }
 
 export default createLongMemory;

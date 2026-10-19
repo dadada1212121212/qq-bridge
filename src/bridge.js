@@ -48,6 +48,7 @@ import { createLongMemory, localDayString } from './long-memory.js';
 import { createConsoleServer } from './console-server.js';
 import { createWakePrompt } from './wake-prompt.js';
 import { createSocialState } from './social-state.js';
+import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays } from './social-mechanisms.js';
 import {
   loadSlang,
   saveSlang,
@@ -6767,6 +6768,192 @@ async function main() {
     return lm.recall({ key, queryText, maxChars: Number(cfg.socialV2?.longMemory?.recallMaxChars) || 400 });
   }
 
+  // ── [拟人强化四件套 2026-10-19] 事件跟进 / 纪念日 / 记忆自检 / 对人冷场余波 ──
+  // 词表与日期规则在 src/social-mechanisms.js（可脱离桥接单测），这里只做状态接线。
+  // 台账都挂 st（followUps / coldShoulder / lastMemorySelfCheckAt，social-state 已持久化）。
+  function followUpsCfgV2() {
+    const f = cfg.socialV2?.followUps && typeof cfg.socialV2.followUps === 'object' ? cfg.socialV2.followUps : {};
+    return { enabled: f.enabled !== false, maxAgeDays: Math.max(1, Number(f.maxAgeDays) || 10) };
+  }
+  function coldShoulderCfgV2() {
+    const c = cfg.socialV2?.coldShoulder && typeof cfg.socialV2.coldShoulder === 'object' ? cfg.socialV2.coldShoulder : {};
+    return { enabled: c.enabled !== false, hours: Math.min(24, Math.max(0.5, Number(c.hours) || 2)) };
+  }
+
+  // ①事件后主动跟进：有人「亲口」对她说了一件带未来时间的事（明天考试/下周面试…），
+  // 记一笔；事件后过一天由看门狗（promiseDueTickV2 同一个 60s tick）叫她主动去问结果。
+  function maybeRecordFollowUpV2(key, st, { plainContent, userId }) {
+    if (!st || !followUpsCfgV2().enabled) return false;
+    const now = Date.now();
+    const hit = detectEventFollowUp(plainContent, now);
+    if (!hit) return false;
+    st.followUps = Array.isArray(st.followUps) ? st.followUps : [];
+    // 去重：同一件事（同名事件且到期时间差不多）一天内只记一次 —— 群友会把同一件事说好几遍。
+    if (st.followUps.some((f) => f && f.event === hit.event && Math.abs(Number(f.dueAt) - hit.dueAt) < 86400000)) return false;
+    st.followUps.push({
+      event: hit.event,
+      dueAt: hit.dueAt,
+      followUpAt: hit.followUpAt,
+      senderId: userId != null ? String(userId) : '',
+      recordedAt: now
+    });
+    if (st.followUps.length > 20) st.followUps = st.followUps.slice(-20);
+    saveSocialV2State();
+    log(`[拟人] ${key} 记下事件跟进：「${hit.event}」，${new Date(hit.followUpAt).toLocaleString('zh-CN')} 去问问结果`);
+    appendActivity(`${key} [拟人] 记下事件跟进：「${hit.event}」`);
+    return true;
+  }
+
+  // 看门狗扫描：到点（过点 10 天内也补）就标 remindedAt —— 照 promises 的去重模式，只主动提一次。
+  function followUpDueScanV2(st, now) {
+    const c = followUpsCfgV2();
+    if (!c.enabled || !st || !Array.isArray(st.followUps) || !st.followUps.length) return 0;
+    let due = 0;
+    for (const f of st.followUps) {
+      if (!f || f.done || f.remindedAt) continue;
+      if (now < Number(f.followUpAt)) continue;
+      if (now - Number(f.followUpAt) > c.maxAgeDays * 86400000) { f.done = true; continue; } // 拖太久就不问了
+      f.remindedAt = now;
+      due++;
+    }
+    if (st.followUps.some((f) => f && f.done)) st.followUps = st.followUps.filter((f) => f && !f.done);
+    return due;
+  }
+
+  function followUpLineV2(key) {
+    try {
+      const st = getSocialV2State(key);
+      const now = Date.now();
+      // 展示窗口：被看门狗标记后 24h 内（正该去问的时候）或已到点还没标记过（兜底）。
+      const list = (Array.isArray(st?.followUps) ? st.followUps : [])
+        .filter((f) => f && !f.done && ((Number(f.remindedAt) && now - Number(f.remindedAt) < 86400000)
+          || (!f.remindedAt && now >= Number(f.followUpAt))))
+        .slice(-3);
+      if (!list.length) return '';
+      const pool = [...(Array.isArray(st?.unread) ? st.unread : []), ...(Array.isArray(st?.recentMessages) ? st.recentMessages : [])];
+      const nameOf = (f) => {
+        const sid = String(f.senderId || '');
+        const m = [...pool].reverse().find((x) => x && !x.isSelf && (!sid || String(x.userId || '') === sid));
+        return m?.sender || '群友';
+      };
+      const items = list.map((f) => `- ${nameOf(f)} 之前提到「${f.event}」—— 顺口问一句结果怎么样，别像查岗`).join('\n');
+      return `【该问问了】\n${items}\n\n`;
+    } catch (error) {
+      log('[拟人] 事件跟进注入失败', key, error?.message || error);
+      return '';
+    }
+  }
+
+  // ②纪念日：认识满 N 天的里程碑（数据源 memory-db：本会话首条消息的时间）。
+  function anniversaryLineV2(key) {
+    try {
+      if (!memoryDbEnabled()) return '';
+      const mdb = memoryDb();
+      if (!mdb || typeof mdb.anniversarySignals !== 'function') return '';
+      const sig = mdb.anniversarySignals(key);
+      if (!sig || !sig.keyFirstAt) return '';
+      const days = Math.floor((Date.now() - Number(sig.keyFirstAt)) / 86400000);
+      const milestone = milestoneDays(days);
+      if (!milestone) return '';
+      const who = String(key).startsWith('private:') ? '主人' : '这个群';
+      return `【纪念日】今天是你认识${who}满 ${milestone} 天的日子。聊天时如果自然合适，可以似有若无地提一句（别搞成播报）。\n\n`;
+    } catch (error) {
+      log('[拟人] 纪念日注入失败', key, error?.message || error);
+      return '';
+    }
+  }
+
+  // ③记忆自检：低概率（默认 0.02）+ 至少隔 3 天，随机抽一条旧情景让她「忽然想起很久以前」。
+  function longMemorySelfCheckV2(key) {
+    try {
+      const prob = Math.min(0.2, Math.max(0, Number(cfg.socialV2?.longMemory?.selfCheckProbability ?? 0.02)));
+      if (!prob) return '';
+      const st = getSocialV2State(key);
+      const now = Date.now();
+      if (st && now - (Number(st.lastMemorySelfCheckAt) || 0) < 3 * 86400000) return '';
+      const lm = longMemory();
+      if (!lm || typeof lm.sampleEpisode !== 'function') return '';
+      const ep = lm.sampleEpisode(key);
+      if (!ep || !String(ep.summary || '').trim()) return '';
+      if (st) st.lastMemorySelfCheckAt = now; // 不主动落盘：随下一次常规 save 带走
+      const dayMs = new Date(`${ep.day}T00:00:00`).getTime();
+      const daysAgo = Number.isFinite(dayMs) ? Math.max(1, Math.round((now - dayMs) / 86400000)) : 0;
+      const summary = String(ep.summary).slice(0, 160);
+      return `【记忆闪回】你忽然想起 ${ep.day}${daysAgo ? `（约 ${daysAgo} 天前）` : ''}：${summary}\n和现在聊的搭得上就似有若无地提一句，搭不上就先存着。\n\n`;
+    } catch (error) {
+      log('[拟人] 记忆自检失败', key, error?.message || error);
+      return '';
+    }
+  }
+
+  // ④对人冷场余波：谁对她说难听的（HOSTILE_RE，仅在「真的在跟她说话」的消息上探测），
+  // 之后几小时里跟这个人有点别扭：活跃期沉默率对他 ×3+0.15，提示词里标注「可以淡淡的」。
+  // 和解词（PEACE_RE）当场翻篇；主人免疫（怎么凶都是撒娇，不记账）。
+  function maybeColdShoulderV2(key, st, { userId, plainContent }) {
+    try {
+      const c = coldShoulderCfgV2();
+      if (!c.enabled || !st || userId == null) return false;
+      const sid = String(userId);
+      if (!sid || sid === String(cfg.ownerQQ ?? '')) return false;
+      const text = String(plainContent || '').slice(0, 120);
+      if (!text) return false;
+      st.coldShoulder = (st.coldShoulder && typeof st.coldShoulder === 'object') ? st.coldShoulder : {};
+      if (PEACE_RE.test(text)) {
+        if (st.coldShoulder[sid]) {
+          delete st.coldShoulder[sid];
+          saveSocialV2State();
+          log(`[拟人] ${key} ${sid} 主动和好，冷场余波解除`);
+        }
+        return false;
+      }
+      if (!HOSTILE_RE.test(text)) return false;
+      st.coldShoulder[sid] = { at: Date.now(), hostile: true };
+      // 有界：最多记 30 个人，超了丢最旧的
+      const ids = Object.keys(st.coldShoulder);
+      if (ids.length > 30) {
+        ids.sort((a, b) => (Number(st.coldShoulder[a]?.at) || 0) - (Number(st.coldShoulder[b]?.at) || 0));
+        for (const old of ids.slice(0, ids.length - 30)) delete st.coldShoulder[old];
+      }
+      saveSocialV2State();
+      log(`[拟人] ${key} 记下冷场余波：${sid} 说了不好听的话，接下来 ${c.hours} 小时对他有点别扭`);
+      appendActivity(`${key} [拟人] 对人冷场余波：${sid}`);
+      return true;
+    } catch (error) {
+      log('[拟人] 冷场余波记账失败', key, error?.message || error);
+      return false;
+    }
+  }
+  /** 活跃期沉默判定用：这个人还在「别扭期」吗。 */
+  function coldShoulderActiveV2(st, userId) {
+    const c = coldShoulderCfgV2();
+    if (!c.enabled || !st || userId == null) return false;
+    const entry = st.coldShoulder?.[String(userId)];
+    if (!entry || !entry.hostile) return false;
+    return Date.now() - Number(entry.at) < c.hours * 3600000;
+  }
+  function coldShoulderLineV2(key) {
+    try {
+      const c = coldShoulderCfgV2();
+      if (!c.enabled) return '';
+      const st = getSocialV2State(key);
+      const now = Date.now();
+      const ownerQq = String(cfg.ownerQQ ?? '');
+      const ids = Object.entries(st?.coldShoulder || {})
+        .filter(([sid, v]) => v?.hostile && now - Number(v.at) < c.hours * 3600000 && sid !== ownerQq)
+        .map(([sid]) => sid);
+      if (!ids.length) return '';
+      const pool = [...(Array.isArray(st?.unread) ? st.unread : []), ...(Array.isArray(st?.recentMessages) ? st.recentMessages : [])];
+      const names = [...new Set(ids.map((sid) => {
+        const m = [...pool].reverse().find((x) => x && !x.isSelf && String(x.userId || '') === sid);
+        return m?.sender || '有人';
+      }))];
+      return `【别扭中】${names.join('、')} 之前对你说过不好听的话，你现在跟他们有点别扭：回他们可以淡淡的、慢半拍、短一点，不用装热情，但别彻底装看不见。\n\n`;
+    } catch (error) {
+      log('[拟人] 冷场余波注入失败', key, error?.message || error);
+      return '';
+    }
+  }
+
   // ── [长记忆 2026-10-18] 自动提炼 + 定期整理 ─────────────────────────────────
   // 背景：库里 8052 条消息只长出 24 条 facts（几乎全靠她现场调工具写），会话又是每轮新开，
   // 所以她「不记得上周聊过什么」。这里每轮结束从新消息里规则式提炼几条事实入库（零模型调用），
@@ -7350,7 +7537,7 @@ async function main() {
 
   // 返回 true = 本条消息已在活跃期逻辑内处理（投递或沉默），调用方不再走常规唤醒；
   // 返回 false = 不在活跃窗口，维持原判定结果（不醒）。
-  function maybeActivePeriodDeliveryV2(key, st, { sender, plainContent, quoteTargetIsSelf }) {
+  function maybeActivePeriodDeliveryV2(key, st, { sender, plainContent, quoteTargetIsSelf, userId }) {
     if (!key.startsWith('group:')) return false;
     if (sleepStateV2(key, st).asleep) return false;
     const now = Date.now();
@@ -7363,6 +7550,8 @@ async function main() {
       if (now - spokeAt < 60000) skipProb = 0; // 刚回复 60 秒内不沉默，避免"聊一半突然消失"
       const backlog = Math.max(0, (Array.isArray(st.unread) ? st.unread.length : 1) - 1);
       skipProb = Math.max(0, skipProb - Math.min(0.5, backlog * 0.1)); // 消息越多压力越大，沉默率越低
+      // [拟人] 对人冷场余波：还在跟这个人置气的期间，对他的沉默率 ×3 + 0.15。
+      if (coldShoulderActiveV2(st, userId)) skipProb = Math.min(0.95, skipProb * 3 + 0.15);
       if (Math.random() < skipProb) {
         log(`[reserved2] 活跃期 ${key} 选择性沉默（skip=${skipProb.toFixed(2)}）：不唤醒，${Array.isArray(st.unread) ? st.unread.length : 0} 条未读将随下次唤醒带给模型`);
         appendActivity(`${key} [reserved2] 活跃期选择性沉默：${String(sender ?? '')} 的消息不接`);
@@ -9084,6 +9273,7 @@ async function main() {
     MEME_MOOD_DICT,
     ROLES_DIR,
     accountEnabled,
+    anniversaryLineV2,
     askTurnFooter,
     asksCfgV2,
     buildBroadcastTaskV2,
@@ -9092,6 +9282,7 @@ async function main() {
     buildRecapV2,
     buildStickerContext,
     cfg,
+    coldShoulderLineV2,
     currentRoleHintV2,
     detectMoodsFromText,
     diaryClockV2,
@@ -9103,6 +9294,7 @@ async function main() {
     formatGrumpLineV2,
     formatMemoryV2,
     formatParticipationV2,
+    followUpLineV2,
     getSocialV2State,
     groupRecapTargetDayV2,
     grumpSignalsV2,
@@ -9110,6 +9302,7 @@ async function main() {
     log,
     looksLikeUnfinished,
     longMemoryRecallV2,
+    longMemorySelfCheckV2,
     memoryDb,
     memoryDbEnabled,
     moodBoardLineV2,
@@ -10223,9 +10416,12 @@ async function main() {
     for (const key of socialV2.conversations.keys()) {
       if (!isSessionAllowedInCurrentMode(key)) continue;
       const st = socialV2.conversations.get(key);
-      const list = Array.isArray(st?.promises) ? st.promises : [];
-      if (!list.length) continue;
       const now = Date.now();
+      // [拟人] 事件跟进和待办共用这只 60s 看门狗：都是「到点该主动说一件事」，语义同族。
+      let followUpDue = 0;
+      try { followUpDue = followUpDueScanV2(st, now); } catch (error) { log(`[拟人] 事件跟进扫描异常 ${key}:`, error?.message ?? error); }
+      const list = Array.isArray(st?.promises) ? st.promises : [];
+      if (!list.length && !followUpDue) continue;
       let due = 0;
       for (const p of list) {
         if (!p || p.done || p.remindedAt) continue;
@@ -10233,10 +10429,16 @@ async function main() {
         p.remindedAt = now;
         due++;
       }
-      if (!due) continue;
-      saveSocialV2State();
-      log(`[待办] ${key} 有 ${due} 条待办到期，安排一次主动提醒`);
-      try { scheduleWakeV2(key, 'promiseDue'); } catch (error) { log(`[待办] 调度提醒失败 ${key}:`, error?.message ?? error); }
+      if (due) {
+        saveSocialV2State();
+        log(`[待办] ${key} 有 ${due} 条待办到期，安排一次主动提醒`);
+        try { scheduleWakeV2(key, 'promiseDue'); } catch (error) { log(`[待办] 调度提醒失败 ${key}:`, error?.message ?? error); }
+      }
+      if (followUpDue) {
+        saveSocialV2State();
+        log(`[拟人] ${key} 有 ${followUpDue} 件事件到点该问结果，安排一次主动跟进`);
+        try { scheduleWakeV2(key, 'followUp'); } catch (error) { log(`[拟人] 调度跟进失败 ${key}:`, error?.message ?? error); }
+      }
     }
   }
   function startPromiseWatchV2() {
@@ -10679,6 +10881,9 @@ async function main() {
     nameMention: 70,
     // [承诺/待办] 到期待办：比普通概率唤醒高，比真实点名低 —— 提醒够主动，但不抢话。
     promiseDue: 68,
+    // [拟人] 事件跟进（某人提过的事到点该去问结果）：和 promiseDue 同族，让它一位 ——
+    // 都是她「欠着的一个交代」，但问结果不如兑现承诺紧急。
+    followUp: 66,
     // [群聊小总结] 到点发总结：比概率唤醒略高（是"该做的事"不是"看情况"），
     // 但比真实点名低得多 —— 有人在叫她的时候，先接人，再总结。
     groupRecap: 62,
@@ -11156,6 +11361,12 @@ async function main() {
         // [并发] 有人直接找她（@/名字/关键词/提问/拍一拍…）就记一条台账：热闹时一个回合接不完，
         // 后面的回合 / 并发槽 / 补答回合都要靠这份名单把人都接住，不能漏。
         recordAskV2(key, st, { reason, msg: incomingMsg });
+        // [拟人四件套] 只在「真的在跟她说话」的消息上探测（引用她/点名类文本），
+        // 顺嘴聊天不记：①事件跟进 ④对人冷场余波（敌意/和解都在这判）。
+        if (quoteTargetIsSelf || isMustReplyText(plainContent)) {
+          maybeRecordFollowUpV2(key, st, { plainContent, userId: event.user_id });
+          maybeColdShoulderV2(key, st, { userId: event.user_id, plainContent });
+        }
         if (reason) {
           const peakWin = peakQuietAppliesV2(key);
           if (peakWin) {
@@ -11175,7 +11386,7 @@ async function main() {
           } else {
             scheduleWakeV2(key, reason);
           }
-        } else if (maybeActivePeriodDeliveryV2(key, st, { sender, plainContent, quoteTargetIsSelf })) {
+        } else if (maybeActivePeriodDeliveryV2(key, st, { sender, plainContent, quoteTargetIsSelf, userId: event.user_id })) {
           // [patch 活跃期选择性沉默] 触发链未命中但会话处于活跃窗口：
           // 已在上面的助手内处理（投递 anyMessage / 掷骰沉默 / 节流），无需常规唤醒。
         }

@@ -28,12 +28,14 @@ export function createWakePrompt(S) {
     text,
     truncateText,
     accountEnabled,
+    anniversaryLineV2,
     asksCfgV2,
     buildBroadcastTaskV2,
     buildDiaryTaskV2,
     buildGroupRecapTaskV2,
     buildRecapV2,
     cfg,
+    coldShoulderLineV2,
     currentRoleHintV2,
     diaryClockV2,
     diaryKeyV2,
@@ -41,10 +43,12 @@ export function createWakePrompt(S) {
     diaryTargetDayV2,
     formatMemoryV2,
     formatParticipationV2,
+    followUpLineV2,
     getSocialV2State,
     groupRecapTargetDayV2,
     historyRecallV2,
     longMemoryRecallV2,
+    longMemorySelfCheckV2,
     memoryDb,
     memoryDbEnabled,
     moodBoardLineV2,
@@ -147,6 +151,16 @@ export function createWakePrompt(S) {
     }
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
+    // [拟人四件套 2026-10-19] 事件跟进 / 纪念日 / 记忆自检 / 对人冷场余波。
+    // 都按会话取数、都本地零 token；empty 时返回 ''，不占提示词。
+    let followUpLine = '';
+    try { followUpLine = followUpLineV2(key); } catch (e) { log('[拟人] 事件跟进注入失败：' + (e?.message || e)); }
+    let anniversaryLine = '';
+    try { anniversaryLine = anniversaryLineV2(key); } catch (e) { log('[拟人] 纪念日注入失败：' + (e?.message || e)); }
+    let memorySelfCheckLine = '';
+    try { memorySelfCheckLine = longMemorySelfCheckV2(key); } catch (e) { log('[拟人] 记忆自检失败：' + (e?.message || e)); }
+    let coldShoulderLine = '';
+    try { coldShoulderLine = coldShoulderLineV2(key); } catch (e) { log('[拟人] 冷场余波注入失败：' + (e?.message || e)); }
     // [patch 日记] 她写过的小记只喂给她自己的那个会话（不往群里带：私人内容外泄 + 省 token）。
     let diaryLine = '';
     try {
@@ -362,7 +376,8 @@ export function createWakePrompt(S) {
     const ironLine = '【铁律·最高】演真人，别承认是 AI；单条 ≤60 字；不用 emoji、不念稿；不服务不讨好、有自己的主见和情绪；少@人；不层层递进。\n\n';
     const slowSeg = moeLine + wakeLine + recapLine + dbLine + diaryLine + styleLine + ironLine;
     const volatileSeg = moodLine + grumpLine + moodMemoryLine + moodBoardLine + relationLine + askLine + statusLine + usageLine + stickerContextLine
-      + memoryLine + participationLine + recallLine + longRecallLine + replyLine;
+      + memoryLine + participationLine + recallLine + longRecallLine
+      + followUpLine + anniversaryLine + memorySelfCheckLine + coldShoulderLine + replyLine;
     // [省token] 瘦身模式：补答回合 / 群聊正热时只留「人设 + 规则 + 台账 + 状态 + 收尾」，
     // 砍掉摘要/回放/动漫库/表情清单/参与感/关系/习惯等段落（实测每轮约 4900 → 2200 字）。
     //
@@ -371,7 +386,9 @@ export function createWakePrompt(S) {
     // 变成记不住人的陌生人。回放/关系/口癖/动漫库/表情清单/参与感/用量/账号仍然照砍。
     const slimKeepMemory = asksCfgV2().slimKeepMemory !== false;
     const slimSeg = standingLine + (lean ? '' : slimStaticSeg) + askLine + grumpLine + moodLine + moodBoardLine + statusLine
-      + (slimKeepMemory ? memoryLine : '');
+      + (slimKeepMemory ? memoryLine : '')
+      // [拟人] 瘦身轮也必须带的四件套里的两段：直接决定这轮怎么回人（该问的问、别扭的淡着）。
+      + followUpLine + coldShoulderLine;
     let base = slim ? slimSeg : (stableSeg + slowSeg + volatileSeg);
     if (slim) log('[省token] ' + key + ' 用瘦提示词（' + base.length + ' 字，原因 ' + reason + '）');
     // [分段成本探针] 打开 QQ_WAKE_COST_LOG=1 时，把每一段的真实字符数写进日志。
@@ -389,6 +406,7 @@ export function createWakePrompt(S) {
           moodLine, grumpLine, moodMemoryLine, moodBoardLine, relationLine, statusLine, usageLine, stickerContextLine, memoryLine,
           styleLine,
           participationLine, recallLine, longRecallLine, replyLine,
+          followUpLine, anniversaryLine, memorySelfCheckLine, coldShoulderLine,
         };
         const rows = Object.entries(parts)
           .filter(([, v]) => typeof v === 'string' && v.length > 0)
@@ -477,6 +495,10 @@ export function createWakePrompt(S) {
     if (reason === 'asks') {
       // 补答回合：只答人，不设唤醒条件（那是主回合的事），也不写总结。
       return base + askTurnFooter({ group: isGroupCtx });
+    }
+    // [拟人] 事件跟进：某人之前提的事到点该去问结果了（名单在【该问问了】段里）。
+    if (reason === 'followUp') {
+      return `${base}【该问问了】${key}\n原因：之前有认识的人跟你说过一件这几天出结果的事，现在到点了，该去问问了。看上面【该问问了】名单，像顺手想起一样自然地问一句，别像查岗、别连环追问。问完照常 qq_set_wake_config 收尾。`;
     }
     // [省token 2026-10-18] 原唤醒尾巴 454 字（含【行动前】四连问 + 群/私两套话术 + 一整段引用规则
     // + 「你可以调用工具查看未读消息…」），其中引用规则与 qq_send_message 的工具说明逐字重复，
