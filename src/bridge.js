@@ -33,6 +33,8 @@ import { buildMusicShare, renderMusicShare } from './music-links.js';
 import { startPoll, castVote, closePoll, tallyPoll, decideAmong, renderPoll, renderDecide } from './group-tools.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { priceUsage, resolvePriceTable } from './model-prices.js';
+// [AstrBot 看门狗] 判定与命令构造（纯函数）：待机恢复豁免 + 按端口占用者杀进程
+import { astrbotStandbyResumeScript, shouldSkipAstrbotRestartOnResume, astrbotKillByPortScript } from './astrbot-watch-lib.js';
 // [并发] 群聊并发槽位 / 点名台账 / 出站节奏（纯逻辑，见 src/group-concurrency.js）
 import {
   resolveConcurrencyCfg, isDirectedReason, makeAskEntry, recordAsk, openAsks, claimAsks,
@@ -12109,13 +12111,42 @@ async function main() {
   // 端口还占着、进程还在，但平台连接与回复全废，只能靠人翻日志发现。
   // 计划任务那条路实测在计划任务上下文里会挂住（脚本进程不退出、任务结果一直失败），
   // 所以改由桥接自己看——它本来就常驻，而且已有其它看门狗。
+  //
+  // [patch 2026-10-19] 两条修正，都出自今天凌晨的实录（证据在 src/astrbot-watch-lib.js 头部）：
+  //   ① 「事件循环卡死 12583s」是 Modern Standby（S0 新型待机）冻住整个桌面栈造成的
+  //      假警报：05:08:45 进待机 → 09:08:03 鼠标唤醒，诊断在唤醒后 1 秒记下 lag，
+  //      而进程其实健康（WS 自己重连了）。所以最近退出过待机就只记账、不重启。
+  //   ② 老重启路径「detached 盲 spawn ps1 + 脚本里 SilentlyContinue」失败时无从得知
+  //      （09:08 点了重启，真身 python.exe 根本没被杀掉）。现在按端口占用者杀 + 走
+  //      start-services 拉起 + 把杀了谁记进日志；重启 3 分钟后仍异常就大声报。
   const ASTRBOT_PORT = Number(cfg.astrbot?.port) || 6185;
   // 这两个路径过去写死成 `C:/Users/<用户名>/...`：既把本机用户名带进公开仓库，换台机器也直接失效。
   // 现在默认按仓库位置推（同级目录），并允许 config.json 的 astrbot.serviceLog / restartScript 覆盖。
   const ASTRBOT_SVC_LOG = cfg.astrbot?.serviceLog || path.join(ROOT, '..', 'astrbot', 'logs', 'service.log');
+  const ASTRBOT_START_PS1 = path.join(ROOT, '..', 'qq-dsh-bridge', 'start-services.ps1');
   const ASTRBOT_RESTART_PS1 = cfg.astrbot?.restartScript
     || path.join(ROOT, '..', 'qq-dsh-bridge', 'scripts', 'astrbot-restart-only.ps1');
   let astrbotLastRestartAt = 0;
+  let astrbotEscalatedAt = 0;
+  let astrbotResumeSkipLoggedAt = 0;
+
+  /** 跑一段 PowerShell 并把 stdout 收回来（有超时；老路是 stdio:'ignore' 全盲发）。 */
+  function runPowerShellCapture(script, timeoutMs = 20000) {
+    return new Promise((resolve) => {
+      let out = '';
+      let settled = false;
+      const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch {}
+        done(out.trim());
+      }, timeoutMs);
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], { windowsHide: true });
+      child.stdout.on('data', (d) => { out += String(d); if (out.length > 4000) out = out.slice(-4000); });
+      child.on('error', () => { clearTimeout(timer); done(''); });
+      child.on('close', () => { clearTimeout(timer); done(out.trim()); });
+    });
+  }
+
   async function astrbotProblem() {
     try {
       const res = await fetch(`http://127.0.0.1:${ASTRBOT_PORT}/`, { signal: AbortSignal.timeout(3000) });
@@ -12137,15 +12168,53 @@ async function main() {
     } catch { /* 读不到日志就不判定 */ }
     return '';
   }
+
+  /** 最近 10 分钟内退出新型待机（kernel-power 507）的条数；查不动按 0 算。 */
+  async function recentStandbyResumeCount() {
+    try {
+      const out = await runPowerShellCapture(astrbotStandbyResumeScript(10), 25000);
+      return Number(out) || 0;
+    } catch { return 0; }
+  }
+
+  /** 杀端口占用者（精准命中真身）→ 等 2 秒 → 走 start-services 拉起来。返回杀掉的 pid。 */
+  async function restartAstrbot() {
+    const killed = await runPowerShellCapture(astrbotKillByPortScript(ASTRBOT_PORT));
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    try {
+      const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ASTRBOT_START_PS1, '-Only', 'astrbot'], { detached: true, stdio: 'ignore', windowsHide: true });
+      child.unref();
+    } catch (error) {
+      throw new Error(`start-services 拉起 AstrBot 失败：${error?.message ?? error}`);
+    }
+    return killed;
+  }
+
   async function astrbotWatchTick() {
     const bad = await astrbotProblem();
     if (!bad) return;
-    if (Date.now() - astrbotLastRestartAt < 15 * 60000) return;
+    // ① 系统待机恢复的假警报：进程健康，只记账（30 分钟内不重复刷）
+    const resumeCount = await recentStandbyResumeCount();
+    if (shouldSkipAstrbotRestartOnResume(bad, resumeCount)) {
+      if (Date.now() - astrbotResumeSkipLoggedAt > 30 * 60000) {
+        astrbotResumeSkipLoggedAt = Date.now();
+        log(`[AstrBot 看门狗] ${bad}；但系统刚从新型待机恢复（整个桌面栈一起冻过，诊断报了假 lag），进程是健康的，跳过重启`);
+      }
+      return;
+    }
+    if (Date.now() - astrbotLastRestartAt < 15 * 60000) {
+      // ② 重启 3 分钟还不好的，大声报——老路的静默失败（点了重启其实没杀成）不能再发生
+      if (Date.now() - astrbotLastRestartAt > 3 * 60000 && Date.now() - astrbotEscalatedAt > 15 * 60000) {
+        astrbotEscalatedAt = Date.now();
+        log(`[AstrBot 看门狗] 重启已过 3 分钟仍异常（${bad}）：自动重启可能没生效，请手动跑 ${ASTRBOT_RESTART_PS1} 或翻 astrbot/logs/service.log`);
+      }
+      return;
+    }
     astrbotLastRestartAt = Date.now();
     log(`[AstrBot 看门狗] 检测到异常（${bad}），定向重启 AstrBot`);
     try {
-      const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ASTRBOT_RESTART_PS1], { detached: true, stdio: 'ignore', windowsHide: true });
-      child.unref();
+      const killed = await restartAstrbot();
+      log(`[AstrBot 看门狗] 重启已执行：杀掉端口占用者 pid=${killed || '（无，端口本就没占）'}，已走 start-services 拉起`);
     } catch (error) {
       log(`[AstrBot 看门狗] 重启失败：${error?.message ?? error}`);
     }
