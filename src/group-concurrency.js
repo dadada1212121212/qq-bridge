@@ -238,10 +238,14 @@ export function askStats(list, { now = Date.now(), cfg = DEFAULT_CONCURRENCY_CFG
  * 要不要开第二个会话（并发补答槽）。
  * 只有「已经有人被晾着」且「主会话正忙」时才值得开 —— 开着不用反而更贵（会话本身有固定前缀成本）。
  */
-export function shouldSpawnAux({ stats, auxBusy = false, cfg = DEFAULT_CONCURRENCY_CFG, now = Date.now() } = {}) {
+export function shouldSpawnAux({ stats, auxBusy = false, cfg = DEFAULT_CONCURRENCY_CFG, now = Date.now(), urgent = false } = {}) {
   if (!cfg.enabled) return false;
   if (auxBusy) return false;
   if (!stats || !stats.unclaimed) return false;
+  // [并发补齐 2026-10-19] 紧急模式：主会话正忙时来了「直接点名」（@/叫名/提问），
+  // 只要台账里有 ≥3 秒的未接点名就立刻开第二槽位 —— 不再等「攒够 2 条」或「最老等 50s」。
+  // 3 秒下限是防止刚记完账的同一瞬间重复派发。
+  if (urgent && stats.oldestUnclaimedWaitMs >= 3000) return true;
   if (stats.unclaimed >= cfg.auxMinAsks) return true;
   return stats.oldestUnclaimedWaitMs >= cfg.auxAfterMs * 2;
 }

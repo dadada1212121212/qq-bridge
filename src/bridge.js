@@ -8369,8 +8369,9 @@ async function main() {
    * 只在真的有 2 个人以上在等（或有人等太久）时才开，避免平时把成本翻倍；
    * 提示词走瘦身版（只带人设 + 规则 + 台账 + 状态），比主回合省一半以上。
    */
-  async function spawnAuxWakeV2(key) {
+  async function spawnAuxWakeV2(key, opts = {}) {
     try {
+      const urgent = opts.urgent === true; // [并发补齐] 主会话忙时的直接点名：立刻开槽，不等攒单/等老化
       const c = concurrencyCfgV2();
       if (!c.enabled) return false;
       if (!String(key).startsWith('group:')) return false;
@@ -8381,11 +8382,11 @@ async function main() {
       if (!st) return false;
       if (sleepStateV2(key, st).asleep) return false; // 睡着时不开回合；她醒了自然看得到台账
       const now = Date.now();
-      if (now - (auxWakeAtV2.get(key) || 0) < 15000) return false; // 15s 内不重复派发
+      if (now - (auxWakeAtV2.get(key) || 0) < (urgent ? 8000 : 15000)) return false; // 派发去重（紧急路径放宽到 8s）
       const auxId = state.auxSessions?.[key];
       const auxBusy = !!(auxId && (v2TurnStartAt.has(auxId) || collectors.has(auxId)));
       const stats = askStats(st.asks, { now, cfg: c });
-      if (!shouldSpawnAux({ stats, auxBusy, cfg: c })) return false;
+      if (!shouldSpawnAux({ stats, auxBusy, cfg: c, urgent })) return false;
       const auxSessionId = await ensureAuxSessionV2(key);
       if (!auxSessionId) return false;
       const ids = claimAsksV2(key, getSocialV2State(key), auxSessionId, 'b');
@@ -10591,8 +10592,11 @@ async function main() {
     }
     if (isConversationBusyV2(key, st)) {
       // [并发] 主会话正忙：群里若还有没接住的点名，让第二槽位先顶上 —— 不占用主会话的回合。
+      // [并发补齐 2026-10-19] 直接点名（@/叫名/提问/拍一拍）走 urgent 路径：只要台账里有
+      // ≥3 秒的未接点名立刻开槽（旧行为要攒够 2 条或最老等 50s，单条 @ 在长回合里要干等）。
       if (String(key).startsWith('group:')) {
-        void spawnAuxWakeV2(key).catch((error) => log('[并发] 第二槽位异常 ' + key + '：' + (error?.message ?? error)));
+        const urgentAsk = isDirectedReason(reason);
+        void spawnAuxWakeV2(key, { urgent: urgentAsk }).catch((error) => log('[并发] 第二槽位异常 ' + key + '：' + (error?.message ?? error)));
       }
       if (!Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons = [];
       const seq = st.lastUnreadSeq || 0;
@@ -11526,6 +11530,18 @@ async function main() {
               // [并发] 主回合收场：真的发出消息才算「答过」，否则把点名放回台账（下一轮再答）。
               if (pendingAskClaimsV2.has(frame.sessionId)) {
                 settleAsksV2(key, getSocialV2State(key), frame.sessionId, sendToolSucceededSessions.has(frame.sessionId));
+                // [并发补齐 2026-10-19] 主回合结束了台账里还有没人管的点名 → 立刻让第二槽位
+                // 顶上（3 秒缓冲让主回合的收尾先落定），不再等 45s 的追赶轮询 —— 这是
+                // 「群里 @ 她半天没人应」的主要成因之一。
+                try {
+                  const stAfterMain = getSocialV2State(key);
+                  if (stAfterMain && asksNeedWakeV2(stAfterMain) && !isConversationBusyV2(key, stAfterMain)) {
+                    setTimeout(() => {
+                      spawnAuxWakeV2(key, { urgent: true }).catch(() => {});
+                    }, 3000).unref?.();
+                    log('[并发] ' + key + ' 主回合结束仍有未接点名，3s 后派第二槽位');
+                  }
+                } catch { /* 补齐失败不影响收场 */ }
               }
               // reserved2 无行动兜底：普通唤醒回合若既没发消息、也没 mark_read / set_wake_config，
               // 则累计 noActionCount；达到阈值后自动重置 WakeConfig，避免 AI 卡死。
