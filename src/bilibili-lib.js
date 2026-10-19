@@ -11,6 +11,8 @@
 //   · x/web-interface/wbi/search/*：需要 wbi 签名（w_rid/wts）+ buvid3 cookie，否则 -412。
 // buvid3 用公开的 finger/spi 接口现取（无需登录），wbi key 用 nav 接口现取（缓存 1h）。
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const API = 'https://api.bilibili.com';
@@ -53,23 +55,44 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
   let wbiCache = null; // { imgKey, subKey, at }
   let buvidCache = null; // { buvid3, at }
 
-  async function rawJson(url, { timeoutMs = 8000 } = {}) {
+  async function rawJson(url, { timeoutMs = 8000, method = 'GET', body = null, auth = false } = {}) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await f(url, {
-        signal: ctrl.signal,
-        headers: {
-          'user-agent': UA,
-          referer: 'https://www.bilibili.com/',
-          origin: 'https://www.bilibili.com'
-        }
-      });
+      const headers = {
+        'user-agent': UA,
+        referer: 'https://www.bilibili.com/',
+        origin: 'https://www.bilibili.com'
+      };
+      // [养鱼 2026-10-19] 写操作带登录 cookie。auth 的三件套来自 state/bili-account.json
+      // （主人导出，不入库不进 git）。写操作的 referer 必须是具体页面路径，这里用主站兜底。
+      if (auth) {
+        const a = await ensureAuth();
+        headers.cookie = `SESSDATA=${a.SESSDATA}; bili_jct=${a.biliJct}; DedeUserID=${a.DedeUserID}`;
+      }
+      const init = { signal: ctrl.signal, headers };
+      if (method !== 'GET') {
+        init.method = method;
+        init.headers['content-type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
+        init.body = body;
+      }
+      const res = await f(url, init);
       if (!res.ok) throw new Error(`HTTP ${res.status ?? res.statusCode}`);
       return await res.json();
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // [养鱼 2026-10-19] 登录态：{ SESSDATA, biliJct, DedeUserID }。authLoader 由 MCP 壳注入
+  // （读 state/bili-account.json），库层不碰文件系统，方便单测。
+  let authLoader = null;
+  function setAuthLoader(loader) { authLoader = loader; }
+  async function ensureAuth() {
+    if (!authLoader) throw new Error('B 站账号还没接入：这是写操作，需要先导入登录 cookie（见 bili-account.json 的导入说明）');
+    const a = await authLoader();
+    if (!a?.SESSDATA || !a?.biliJct || !a?.DedeUserID) throw new Error('B 站 cookie 不完整（需要 SESSDATA / bili_jct / DedeUserID 三个字段），重新导一次');
+    return a;
   }
 
   async function getBuvid3() {
@@ -219,7 +242,158 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
     return { aid, title, comments: out, total: String(d?.page?.acount || d?.page?.count || '?') };
   }
 
-  return { search, videoInfo, popular, userInfo, comments, _internal: { getBuvid3, getWbiKeys, biliGet } };
+  /** UP 主的最近投稿。input 支持 mid 或昵称（昵称先搜人）。 */
+  async function userVideos(input, { limit = 5 } = {}) {
+    const s = String(input || '').trim();
+    let mid = /^\d{5,}$/.test(s) ? s : '';
+    let upName = '';
+    if (!mid) {
+      const found = await search(s, { kind: 'user', limit: 1 });
+      if (!found.length) throw new Error('没搜到这个 UP 主，换个名字试试');
+      mid = found[0].mid;
+      upName = found[0].name;
+    }
+    // 空间投稿列表要 wbi 签名（x/space/wbi/arc/search）
+    const d = await biliGet(`/x/space/wbi/arc/search?mid=${mid}&ps=15&pn=1&order=pubdate`, { signed: true });
+    const list = Array.isArray(d?.list?.vlist) ? d.list.vlist : [];
+    return {
+      mid, name: upName || stripEm(d?.list?.vlist?.[0]?.author || ''),
+      count: list.slice(0, Math.min(10, Math.max(1, limit))).map((v) => ({
+        bvid: v.bvid, title: stripEm(v.title), play: Number(v.play) || 0,
+        danmaku: Number(v.video_review) || 0, duration: String(v.length || ''),
+        pubdate: Number(v.created) || 0,
+        url: `https://www.bilibili.com/video/${v.bvid}`
+      }))
+    };
+  }
+
+  /** 番剧/影视搜索（media_bangumi：番剧+国创+纪录片+电影电视剧条目）。 */
+  async function animeSearch(keyword, { limit = 5 } = {}) {
+    const data = await biliGet(`/x/web-interface/wbi/search/type?search_type=media_bangumi&keyword=${encodeURIComponent(String(keyword || '').slice(0, 60))}&page=1`, { signed: true });
+    const list = Array.isArray(data?.result) ? data.result : [];
+    return list.slice(0, Math.min(8, Math.max(1, limit))).map((r) => ({
+      title: stripEm(r.title),
+      seasonId: r.season_id != null ? String(r.season_id) : '',
+      styles: Array.isArray(r.styles) ? r.styles.join('/') : '',
+      areas: Array.isArray(r.areas) ? r.areas.map((a) => a.name).join('/') : '',
+      year: Number(r.pubtime) ? new Date(r.pubtime * 1000).toISOString().slice(0, 10) : '',
+      eval: stripEm(r.desc || '').slice(0, 80),
+      url: r.url ? String(r.url) : (r.season_id ? `https://www.bilibili.com/bangumi/play/ss${r.season_id}` : '')
+    }));
+  }
+
+  // ── [养鱼 2026-10-19] 写操作（发评论/点赞/投币）—— 全部过持久频控 ──────────
+  // 频控为什么持久化在文件：MCP server 是 stdio 短命进程，DSH 一重启内存计数就清零，
+  // 那频控等于没有。状态文件放桥接 state/ 下（gitignore 覆盖，不入库）。
+  // 硬限：评论 5 条/天、点赞 20 次/天、投币 2 个/天，同类操作间隔 ≥30 分钟，同视频只评一次。
+  let quotaPath = null;
+  function setQuotaFile(p) { quotaPath = p; }
+  const QUOTA_CAPS = { comments: 5, likes: 20, coins: 2 };
+  const QUOTA_NAMES = { comments: '评论', likes: '点赞', coins: '投币' };
+  const QUOTA_GAP_MS = 30 * 60000;
+
+  function loadQuota() {
+    const day = new Date().toISOString().slice(0, 10);
+    try {
+      const j = JSON.parse(fs.readFileSync(quotaPath, 'utf8'));
+      if (j?.day === day) return j;
+    } catch { /* 新文件/损坏：按空额度开始 */ }
+    return { day, comments: [], likes: [], coins: [], videoSeen: [] };
+  }
+  function saveQuota(q) {
+    try {
+      fs.mkdirSync(path.dirname(quotaPath), { recursive: true });
+      fs.writeFileSync(quotaPath, JSON.stringify(q));
+    } catch (e) { log('[bilibili] 频控文件写入失败:', e?.message || e); }
+  }
+  function quotaTake(q, kind) {
+    const now = Date.now();
+    const arr = (q[kind] || []).filter((t) => now - t < 86400000);
+    if (arr.length >= QUOTA_CAPS[kind]) {
+      throw new Error(`今日${QUOTA_NAMES[kind]}额度已用完（${QUOTA_CAPS[kind]} 次/天，防风控硬限）——养号像人，细水长流`);
+    }
+    if (arr.length && now - arr[arr.length - 1] < QUOTA_GAP_MS) {
+      throw new Error(`距上一次${QUOTA_NAMES[kind]}不到 30 分钟，歇一会再动（防风控）`);
+    }
+    arr.push(now);
+    q[kind] = arr;
+  }
+  function quotaCheckVideoOnce(q, aid) {
+    if ((q.videoSeen || []).includes(aid)) throw new Error('这个视频今天已经互动过了，换一个（同一视频反复操作是最典型的机器人特征）');
+    (q.videoSeen = q.videoSeen || []).push(aid);
+    if (q.videoSeen.length > 50) q.videoSeen = q.videoSeen.slice(-50);
+  }
+
+  /** 我是谁（验证 cookie 是否有效）：带 auth 调 nav。 */
+  async function me() {
+    const j = await rawJson(`${API}/x/web-interface/nav`, { auth: true });
+    if (j?.code === -101) throw new Error('cookie 已失效（B 站把这次请求当游客了）——重新导出一次登录 cookie');
+    if (j?.code !== 0) throw new Error(`nav 返回 ${j?.code}: ${j?.message || ''}`);
+    const d = j.data;
+    return { mid: String(d.mid), uname: d.uname, level: d.level, coin: d.money, isLogin: !!d.isLogin };
+  }
+
+  /** 以她的名义发一条评论（频控内）。input 支持 BV/av/链接。 */
+  async function postComment(input, message) {
+    const text = String(message || '').replace(/\s+/g, ' ').trim();
+    if (!text) throw new Error('评论内容是空的');
+    if (text.length > 500) throw new Error('评论太长（B 站上限约 500 字），说短点');
+    const id = parseVideoId(input);
+    if (!id) throw new Error('认不出视频标识：给 BV 号、av 号或 bilibili 视频链接');
+    const v = await biliGet(`/x/web-interface/view?${id.bvid ? `bvid=${id.bvid}` : `aid=${id.aid}`}`);
+    const q = loadQuota();
+    quotaCheckVideoOnce(q, v.aid);
+    quotaTake(q, 'comments'); // 先占额度：写入失败也不返还，比超发安全
+    const a = await ensureAuth();
+    const body = new URLSearchParams({ oid: String(v.aid), type: '1', message: text, plat: '1', csrf: a.biliJct });
+    const j = await rawJson(`${API}/x/v2/reply/add`, { method: 'POST', body: body.toString(), auth: true });
+    if (j?.code !== 0) {
+      const human = j?.code === -111 ? 'csrf 失效，重新导 cookie' : j?.code === -509 || j?.code === 12061 ? '触发风控/评论太快，今天先歇了' : j?.message || j?.msg || '未知原因';
+      saveQuota(q);
+      throw new Error(`评论失败（code ${j?.code}）：${human}`);
+    }
+    saveQuota(q);
+    log(`[bilibili] 已评论 aid=${v.aid}：${text.slice(0, 40)}`);
+    return { ok: true, aid: v.aid, bvid: v.bvid, title: stripEm(v.title), text, url: `https://www.bilibili.com/video/${v.bvid}` };
+  }
+
+  /** 点赞（频控内）。 */
+  async function likeVideo(input) {
+    const id = parseVideoId(input);
+    if (!id) throw new Error('认不出视频标识：给 BV 号、av 号或 bilibili 视频链接');
+    const v = await biliGet(`/x/web-interface/view?${id.bvid ? `bvid=${id.bvid}` : `aid=${id.aid}`}`);
+    const q = loadQuota();
+    quotaCheckVideoOnce(q, v.aid);
+    quotaTake(q, 'likes');
+    const a = await ensureAuth();
+    const body = new URLSearchParams({ aid: String(v.aid), like: '1', csrf: a.biliJct });
+    const j = await rawJson(`${API}/x/web-interface/archive/like`, { method: 'POST', body: body.toString(), auth: true });
+    if (j?.code !== 0) { saveQuota(q); throw new Error(`点赞失败（code ${j?.code}）：${j?.message || j?.msg || '未知原因'}`); }
+    saveQuota(q);
+    return { ok: true, bvid: v.bvid, title: stripEm(v.title) };
+  }
+
+  /** 投 1 枚硬币（频控内，默认不同时点赞）。 */
+  async function coinVideo(input) {
+    const id = parseVideoId(input);
+    if (!id) throw new Error('认不出视频标识：给 BV 号、av 号或 bilibili 视频链接');
+    const v = await biliGet(`/x/web-interface/view?${id.bvid ? `bvid=${id.bvid}` : `aid=${id.aid}`}`);
+    const q = loadQuota();
+    quotaCheckVideoOnce(q, v.aid);
+    quotaTake(q, 'coins');
+    const a = await ensureAuth();
+    const body = new URLSearchParams({ oid: String(v.aid), bvid: v.bvid, multiply: '1', select_like: '0', csrf: a.biliJct });
+    const j = await rawJson(`${API}/x/web-interface/coin/add`, { method: 'POST', body: body.toString(), auth: true });
+    if (j?.code !== 0) { saveQuota(q); throw new Error(`投币失败（code ${j?.code}）：${j?.message || j?.msg || '未知原因（硬币不足/自己视频/风控）'}`); }
+    saveQuota(q);
+    return { ok: true, bvid: v.bvid, title: stripEm(v.title) };
+  }
+
+  return {
+    search, videoInfo, popular, userInfo, comments, userVideos, animeSearch,
+    postComment, likeVideo, coinVideo, me,
+    _internal: { getBuvid3, getWbiKeys, biliGet, setAuthLoader, ensureAuth, setQuotaFile, loadQuota }
+  };
 }
 
 /** 去掉搜索结果标题里的 <em class="keyword"> 高亮标签。 */
