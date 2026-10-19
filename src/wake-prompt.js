@@ -44,6 +44,7 @@ export function createWakePrompt(S) {
     getSocialV2State,
     groupRecapTargetDayV2,
     historyRecallV2,
+    longMemoryRecallV2,
     memoryDb,
     memoryDbEnabled,
     moodBoardLineV2,
@@ -131,6 +132,18 @@ export function createWakePrompt(S) {
       if (recallText) recallLine = `${recallText}\n\n`;
     } catch (error) {
       log('[历史回想] 生成失败', key, error?.message || error);
+    }
+    // [超长记忆 2026-10-19] 情景记忆检索（episodic）：按来信关键词找「很久以前」的某天
+    // + 「去年的今天」。本地 SQLite 检索零 token，预算 ≤400 字，排在历史回想之后。
+    let longRecallLine = '';
+    try {
+      const unreadList2 = Array.isArray(st?.unread) ? st.unread : [];
+      const newestIncoming2 = [...unreadList2].reverse().find((m) => m && !m.isSelf)
+        || [...(Array.isArray(st?.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
+      const longText = newestIncoming2 ? longMemoryRecallV2(key, newestIncoming2.plain || newestIncoming2.text || '') : '';
+      if (longText) longRecallLine = `${longText}\n\n`;
+    } catch (error) {
+      log('[超长记忆] 检索注入失败', key, error?.message || error);
     }
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
@@ -349,7 +362,7 @@ export function createWakePrompt(S) {
     const ironLine = '【铁律·最高】演真人，别承认是 AI；单条 ≤60 字；不用 emoji、不念稿；不服务不讨好、有自己的主见和情绪；少@人；不层层递进。\n\n';
     const slowSeg = moeLine + wakeLine + recapLine + dbLine + diaryLine + styleLine + ironLine;
     const volatileSeg = moodLine + grumpLine + moodMemoryLine + moodBoardLine + relationLine + askLine + statusLine + usageLine + stickerContextLine
-      + memoryLine + participationLine + recallLine + replyLine;
+      + memoryLine + participationLine + recallLine + longRecallLine + replyLine;
     // [省token] 瘦身模式：补答回合 / 群聊正热时只留「人设 + 规则 + 台账 + 状态 + 收尾」，
     // 砍掉摘要/回放/动漫库/表情清单/参与感/关系/习惯等段落（实测每轮约 4900 → 2200 字）。
     //
@@ -375,7 +388,7 @@ export function createWakePrompt(S) {
           moeLine, wakeLine, recapLine, dbLine, diaryLine,
           moodLine, grumpLine, moodMemoryLine, moodBoardLine, relationLine, statusLine, usageLine, stickerContextLine, memoryLine,
           styleLine,
-          participationLine, recallLine, replyLine,
+          participationLine, recallLine, longRecallLine, replyLine,
         };
         const rows = Object.entries(parts)
           .filter(([, v]) => typeof v === 'string' && v.length > 0)

@@ -44,6 +44,7 @@ import { createTokenLedger } from './token-ledger.js';
 // [patch 暴躁] 贴吧老哥模式：判定纯逻辑在 grump-mode.js（被 @ 塞长文 / 刷屏 / 反复问 / 离谱问题）
 import { resolveGrumpCfg, grumpSignalsV2, formatGrumpLineV2, grumpMoodNoteV2 } from './grump-mode.js';
 import { createMemoryDb } from './memory-db.js';
+import { createLongMemory, localDayString } from './long-memory.js';
 import { createConsoleServer } from './console-server.js';
 import { createWakePrompt } from './wake-prompt.js';
 import { createSocialState } from './social-state.js';
@@ -6567,6 +6568,74 @@ async function main() {
     return cfg.socialV2?.memoryDb?.enabled !== false;
   }
 
+  // ── [超长记忆 2026-10-19] 情景记忆层（episodic）──────────────────────────────
+  // memory-db 管「人/事实/梗」，这里管「某天和谁聊了什么」的时间线：每天本地固化一段
+  // 情景摘要进 episodes 表（零 LLM token），唤醒时按来信关键词 × 时间衰减 × 重要性
+  // 检索注入「【很久以前】」段，外加「去年的今天」时间感知。详见 src/long-memory.js 头注释。
+  let longMemoryRef = null;
+  let longMemoryFailed = false;
+  function longMemory() {
+    if (longMemoryRef) return longMemoryRef;
+    if (longMemoryFailed) return null;
+    if (cfg.socialV2?.longMemory?.enabled === false) { longMemoryFailed = true; return null; }
+    try {
+      longMemoryRef = createLongMemory({
+        file: path.join(STATE_DIR, 'long-memory.db'),
+        log: (...a) => log('[long-memory]', ...a)
+      });
+      log('[long-memory] 已打开', longMemoryRef.file);
+    } catch (error) {
+      longMemoryFailed = true;
+      longMemoryRef = null;
+      log('[long-memory] 初始化失败，超长记忆关闭:', error?.message || error);
+    }
+    return longMemoryRef;
+  }
+
+  /**
+   * 每日固化（懒触发）：在唤醒路径上顺带跑，内部用 meta 日期判重 —— 每天最多真正执行一次，
+   * 其余唤醒只是一条 SELECT。固化范围 = 每个活跃会话最近 2 个完整天（今天不固化，还没过完）。
+   * 顺带执行遗忘清理（importance=1 过期删除，3 = 有约定/冲突，永不自动删）。
+   */
+  function consolidateLongMemoryDaily() {
+    if (cfg.socialV2?.longMemory?.enabled === false) return;
+    const lm = longMemory();
+    const mdb = memoryDb();
+    if (!lm || !mdb || typeof mdb.daySignals !== 'function') return;
+    try {
+      const todayStr = localDayString(0);
+      if (lm.lastConsolidateDay() === todayStr) return;
+      const mdbMood = mdb.recentMoodEvents ? mdb.recentMoodEvents(20) : [];
+      for (const key of socialV2.conversations.keys()) {
+        if (!key || typeof key !== 'string' || !/^(group|private):\d+$/.test(key)) continue;
+        for (let i = 1; i <= 2; i++) {
+          const day = localDayString(i);
+          if (lm.hasEpisode(key, day)) continue;
+          const sig = mdb.daySignals(key, day);
+          if (!sig || sig.messages.length < 3) continue;
+          // 当天主要心情：取当天最后一条心情事件
+          const moodOf = (mdbMood || []).filter((m) => m && localDayString(0, new Date(Number(m.at || 0))) === day).map((m) => m.mood);
+          sig.mood = moodOf.length ? String(moodOf[moodOf.length - 1]) : '';
+          lm.consolidateDay(key, day, sig);
+        }
+      }
+      lm.setLastConsolidateDay(todayStr);
+      const removed = lm.prune({ keepDays: Number(cfg.socialV2?.longMemory?.keepDays) || 120 });
+      const stAfter = lm.stats();
+      log(`[long-memory] 每日固化完成（episodes ${stAfter.episodes} 条，覆盖 ${stAfter.oldest || '-'} ~ ${stAfter.newest || '-'}，清理 ${removed} 条）`);
+    } catch (error) {
+      log('[long-memory] 固化失败:', error?.message || error);
+    }
+  }
+
+  /** 唤醒注入：按来信内容检索超长记忆（很久以前 + 去年的今天）。 */
+  function longMemoryRecallV2(key, queryText) {
+    if (cfg.socialV2?.longMemory?.enabled === false) return '';
+    const lm = longMemory();
+    if (!lm) return '';
+    return lm.recall({ key, queryText, maxChars: Number(cfg.socialV2?.longMemory?.recallMaxChars) || 400 });
+  }
+
   // ── [长记忆 2026-10-18] 自动提炼 + 定期整理 ─────────────────────────────────
   // 背景：库里 8052 条消息只长出 24 条 facts（几乎全靠她现场调工具写），会话又是每轮新开，
   // 所以她「不记得上周聊过什么」。这里每轮结束从新消息里规则式提炼几条事实入库（零模型调用），
@@ -8905,6 +8974,7 @@ async function main() {
     historyRecallV2,
     log,
     looksLikeUnfinished,
+    longMemoryRecallV2,
     memoryDb,
     memoryDbEnabled,
     moodBoardLineV2,
@@ -9247,6 +9317,8 @@ async function main() {
   async function sendWakePromptV2(key, reason) {
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
+    // [超长记忆] 懒触发每日固化：meta 判重，每天真正只跑一次，其余唤醒只是一条 SELECT。
+    try { consolidateLongMemoryDaily(); } catch { /* 固化失败不影响唤醒 */ }
     if (!isSessionAllowedInCurrentMode(key)) {
       log(`[reserved2] 跳过唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;

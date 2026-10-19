@@ -1246,6 +1246,22 @@ export function createMemoryDb({ file, tokenUsageFile = '', log = () => {}, maxF
     }
   }
 
+  // [超长记忆 2026-10-19] 按天取固化信号：某会话某天的消息流水 + 当天新学的事实 + 事件。
+  // 供 long-memory.js 的每日固化（episodic 记忆编码）使用，零 LLM token。
+  function daySignals(key, day) {
+    try {
+      const start = new Date(`${day}T00:00:00`).getTime();
+      const end = start + 86400000;
+      const messages = db.prepare('SELECT sender, is_self, text, at FROM messages WHERE key = ? AND at >= ? AND at < ? ORDER BY at ASC LIMIT 500').all(key, start, end);
+      const facts = db.prepare('SELECT text FROM facts WHERE created_at >= ? AND created_at < ? ORDER BY id DESC LIMIT 20').all(start, end).map((r) => r.text);
+      const events = db.prepare('SELECT kind, summary FROM events WHERE at >= ? AND at < ? ORDER BY id ASC LIMIT 50').all(start, end);
+      return { messages, facts, events };
+    } catch (error) {
+      log('daySignals failed', error?.message || error);
+      return { messages: [], facts: [], events: [] };
+    }
+  }
+
   function recentPeople(limit) {
     try {
       return db.prepare('SELECT id, nickname, relation, msg_count, last_seen FROM people WHERE kind = \'user\' ORDER BY last_seen DESC LIMIT ?').all(Number(limit) || 30);
@@ -1627,6 +1643,7 @@ export function createMemoryDb({ file, tokenUsageFile = '', log = () => {}, maxF
     buildDigest,
     stats,
     search,
+    daySignals,
     recentPeople,
     personIdByName,
     peopleByIds,
