@@ -97,7 +97,9 @@ export function createSocialState(S) {
         // [养鱼] 每日 B 站巡园：该 key（主人私聊）最近一次领任务的日期。
         lastBiliStrollDay: '',
         // [养鱼·追更] 关注的 UP 主最新投稿水位 { [mid]: { name, lastBvid, lastTitle, lastPubdate, seeded } }。
-        biliFollowState: {}
+        biliFollowState: {},
+        // [养鱼·追更] 当天检查判重 { day, checks, done }：一天最多查 checksPerDay 次、安利一轮。
+        biliFollowCheck: null
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
@@ -244,7 +246,12 @@ export function createSocialState(S) {
                 };
               }
               return clean;
-            })()
+            })(),
+            // [养鱼·追更] 当天检查判重：结构不对就当天重新计数。
+            biliFollowCheck: (val.biliFollowCheck && typeof val.biliFollowCheck === 'object'
+              && /^\d{4}-\d{2}-\d{2}$/.test(String(val.biliFollowCheck.day || '')))
+              ? { day: String(val.biliFollowCheck.day), checks: Number(val.biliFollowCheck.checks) || 0, done: val.biliFollowCheck.done === true }
+              : null
           };
           // 旧状态/异常状态里的指定成员名单也统一归一化，防止“null”/非法值污染。
           if (st.wakeConfig?.triggers && typeof st.wakeConfig.triggers === 'object') {
@@ -362,7 +369,8 @@ export function createSocialState(S) {
           lastMemorySelfCheckAt: Number(st.lastMemorySelfCheckAt) || 0,
           lastBiliStrollDay: String(st.lastBiliStrollDay || ''),
           // [养鱼·追更] 水位跨重启保留（lastBvid 判新就靠它）。
-          biliFollowState: st.biliFollowState && typeof st.biliFollowState === 'object' ? st.biliFollowState : {}
+          biliFollowState: st.biliFollowState && typeof st.biliFollowState === 'object' ? st.biliFollowState : {},
+          biliFollowCheck: st.biliFollowCheck && typeof st.biliFollowCheck === 'object' ? st.biliFollowCheck : null
         };
       }
       atomicWriteJson(SOCIAL_V2_FILE, obj);
