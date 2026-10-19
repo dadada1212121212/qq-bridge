@@ -1262,6 +1262,18 @@ export function createMemoryDb({ file, tokenUsageFile = '', log = () => {}, maxF
     }
   }
 
+  // [数据退役 2026-10-19] 消息流水过期清理（情景摘要固化后，原始流水只需保留有限天数）。
+  function pruneMessages(keepDays = 180) {
+    try {
+      const cutoff = Date.now() - Math.max(30, Number(keepDays) || 180) * 86400000;
+      const r = db.prepare('DELETE FROM messages WHERE at > 0 AND at < ?').run(cutoff);
+      return Number(r?.changes || 0);
+    } catch (error) {
+      log('pruneMessages failed', error?.message || error);
+      return 0;
+    }
+  }
+
   function recentPeople(limit) {
     try {
       return db.prepare('SELECT id, nickname, relation, msg_count, last_seen FROM people WHERE kind = \'user\' ORDER BY last_seen DESC LIMIT ?').all(Number(limit) || 30);
@@ -1644,6 +1656,7 @@ export function createMemoryDb({ file, tokenUsageFile = '', log = () => {}, maxF
     stats,
     search,
     daySignals,
+    pruneMessages,
     recentPeople,
     personIdByName,
     peopleByIds,

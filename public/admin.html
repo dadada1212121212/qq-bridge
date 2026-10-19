@@ -221,6 +221,8 @@ pre.output{margin:0;padding:12px 14px;border-radius:12px;background:var(--surfac
     <div class="nav-group">设置</div>
     <button class="nav-item" data-view="features"><span class="ico">◉</span>功能开关</button>
     <button class="nav-item" data-view="plugins"><span class="ico">⧉</span>插件</button>
+    <button class="nav-item" data-view="cfgfiles"><span class="ico">⇪</span>配置文件</button>
+    <button class="nav-item" data-view="costs"><span class="ico">¥</span>成本账本</button>
     <button class="nav-item" data-view="settings"><span class="ico">⚙</span>白名单与安全</button>
     <button class="nav-item" data-view="runtime"><span class="ico">⚡</span>省 token 与速度</button>
     <button class="nav-item" data-view="ops"><span class="ico">✦</span>运维</button>
@@ -407,6 +409,105 @@ function renderPills() {
     (s.roleMode === 'silent' ? '<span class="pill" style="background:var(--warn-soft);color:var(--warn);border-color:var(--warn-soft)">静默中 · 群里不接话</span>' : '') +
     '<span class="pill">群 · ' + groups + ' 个白名单</span>';
 }
+function renderCfgfiles() {
+  var box = $('view');
+  box.innerHTML = '<div class="card"><h3>配置文件投递</h3>'
+    + '<p class="desc">把配置文件丢进来，系统自动识别归属并配合生效：<b>config 片段</b> → 深合并进 config.json（自动先备份；重启桥接后完整生效）；<b>人设 .md</b> → 替换 roles 人设（热生效，需勾选确认）；<b>关键词清单</b>（每行一个）→ 合并进唤醒关键词。consoleToken 等安全字段拒绝经此通道修改。</p>'
+    + '<div id="cf-drop" style="border:2px dashed #b9c4d4;border-radius:10px;padding:16px;text-align:center;color:#57606a;cursor:pointer">点击选择或拖入文件（.json / .md / .txt，最多 10 个）</div>'
+    + '<input id="cf-file" type="file" multiple accept=".json,.md,.markdown,.txt,.yml,.yaml" style="display:none">'
+    + '<textarea id="cf-paste" rows="4" placeholder="…或把内容直接粘贴到这里" style="width:100%;margin-top:10px;box-sizing:border-box"></textarea>'
+    + '<div style="display:flex;gap:8px;margin-top:8px">'
+    + '<input id="cf-name" placeholder="粘贴内容的文件名（如 wake.json / persona.md / keys.txt）" style="flex:1;padding:6px 10px;border:1px solid #d8dee4;border-radius:8px">'
+    + '<button id="cf-inspect" style="padding:6px 16px;border:1px solid #d8dee4;border-radius:8px;background:#fff;cursor:pointer">识别</button>'
+    + '</div>'
+    + '<div id="cf-results" style="margin-top:12px"></div>'
+    + '<div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
+    + '<button id="cf-apply" style="padding:7px 16px;border:0;border-radius:8px;background:#4d6bfe;color:#fff;cursor:pointer">应用选中（自动先备份）</button>'
+    + '<label style="display:flex;align-items:center;gap:6px;color:#57606a;font-size:13px"><input type="checkbox" id="cf-confirm"> 我确认这是人设文件并要替换 roles/*.md</label>'
+    + '<span id="cf-msg" style="color:#57606a;font-size:13px"></span>'
+    + '</div></div>'
+    + '<div class="card"><h3>应用历史（最新在前）</h3><div id="cf-history">加载中…</div></div>';
+  var lastFiles = [];
+  function setMsg(s, warn) { var el = $('cf-msg'); if (el) { el.textContent = s || ''; el.style.color = warn ? '#b3261e' : '#57606a'; } }
+  function readFiles(files) {
+    var arr = Array.prototype.slice.call(files || []).slice(0, 10);
+    if (!arr.length) return;
+    var left = arr.length, got = [];
+    arr.forEach(function (f) {
+      var rd = new FileReader();
+      rd.onload = function () { got.push({ name: f.name, content: String(rd.result || '') }); if (--left === 0) { lastFiles = got; setMsg('已读取 ' + got.length + ' 个文件，点「识别」'); } };
+      rd.readAsText(f);
+    });
+  }
+  var drop = $('cf-drop');
+  drop.addEventListener('click', function () { $('cf-file').click(); });
+  ['dragover', 'dragenter'].forEach(function (ev) { drop.addEventListener(ev, function (e) { e.preventDefault(); drop.style.borderColor = '#4d6bfe'; }); });
+  ['dragleave', 'drop'].forEach(function (ev) { drop.addEventListener(ev, function (e) { e.preventDefault(); drop.style.borderColor = '#b9c4d4'; }); });
+  drop.addEventListener('drop', function (e) { if (e.dataTransfer && e.dataTransfer.files) readFiles(e.dataTransfer.files); });
+  $('cf-file').addEventListener('change', function (e) { readFiles(e.target.files); });
+  $('cf-inspect').addEventListener('click', function () {
+    var files = lastFiles.slice();
+    var paste = $('cf-paste').value;
+    if (paste && paste.trim()) files = files.concat([{ name: $('cf-name').value || 'paste.txt', content: paste }]);
+    if (!files.length) { setMsg('请先选择/拖入文件或粘贴内容', true); return; }
+    lastFiles = files;
+    api('/api/cfgmods/inspect', { method: 'POST', body: { files: files } }).then(function (r) {
+      var results = r.results || [];
+      var html = results.map(function (it, i) {
+        var color = it.ok ? '#1a7f37' : '#b3261e';
+        var tname = { 'config-merge': 'config 合并', 'role-md': '人设替换', 'keywords-list': '唤醒关键词' }[it.target] || it.target;
+        var chg = (it.changes || []).map(function (c) { return '<div style="color:#57606a;font-size:12.5px">· ' + esc(c) + '</div>'; }).join('');
+        return '<div style="border:1px solid #d8dee4;border-radius:10px;padding:10px;margin-bottom:8px">'
+          + '<label style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><input type="checkbox" class="cf-sel" data-i="' + i + '"' + (it.ok ? ' checked' : ' disabled') + '>'
+          + '<b>' + esc(it.name) + '</b><span style="font-size:12px;padding:1px 8px;border-radius:999px;border:1px solid ' + color + ';color:' + color + '">' + esc(tname) + '</span>'
+          + '<span style="color:#57606a;font-size:12.5px">' + (it.chars || 0) + ' 字符</span></label>'
+          + '<div style="margin:6px 0 0 24px;font-size:13px">' + (it.ok ? esc(it.effect || '') : '<span style="color:#b3261e">' + esc(it.error || '') + '</span>') + '</div>'
+          + (chg ? '<div style="margin:4px 0 0 24px">' + chg + '</div>' : '')
+          + (it.note ? '<div style="margin:4px 0 0 24px;color:#9a6700;font-size:12.5px">' + esc(it.note) + '</div>' : '')
+          + '</div>';
+      }).join('');
+      $('cf-results').innerHTML = html || '<p class="desc">（无结果）</p>';
+      setMsg('识别完成：' + results.filter(function (x) { return x.ok; }).length + '/' + results.length + ' 个可应用');
+    }).catch(function (e) { setMsg('识别失败：' + e.message, true); });
+  });
+  $('cf-apply').addEventListener('click', function () {
+    var chosen = [];
+    document.querySelectorAll('.cf-sel:checked').forEach(function (cb) {
+      var it = lastFiles[Number(cb.dataset.i)];
+      if (it) chosen.push({ name: it.name, content: it.content });
+    });
+    if (!chosen.length) { setMsg('请先识别并勾选要应用的文件', true); return; }
+    api('/api/cfgmods/apply', { method: 'POST', body: { files: chosen, confirmRole: $('cf-confirm').checked } }).then(function (r) {
+      var okN = (r.results || []).filter(function (x) { return x.ok; }).length;
+      setMsg('应用完成 ' + okN + '/' + r.results.length + (r.needsRestart ? '（含需重启项：重启桥接后完整生效）' : ''), !r.ok);
+      toast('配置文件已应用（' + okN + '/' + r.results.length + '）');
+      loadHistory();
+    }).catch(function (e) { setMsg('应用失败：' + e.message, true); });
+  });
+  function loadHistory() {
+    api('/api/cfgmods/history').then(function (r) {
+      var rows = (r.history || []).map(function (e) {
+        var files = (e.files || []).map(function (f) { return esc(f.name) + '→' + esc(f.target || '') + (f.ok ? '' : '（失败）'); }).join('；');
+        return '<tr>'
+          + '<td style="white-space:nowrap;padding:5px 8px;border-bottom:1px solid #eee">' + esc(String(e.time || '').replace('T', ' ').slice(0, 19)) + '</td>'
+          + '<td style="padding:5px 8px;border-bottom:1px solid #eee">' + files + '</td>'
+          + '<td style="padding:5px 8px;border-bottom:1px solid #eee"><button data-rb="' + esc(e.id) + '" style="padding:3px 10px;border:1px solid #d8dee4;border-radius:6px;background:#fff;cursor:pointer">回滚</button></td>'
+          + '</tr>';
+      }).join('');
+      $('cf-history').innerHTML = rows
+        ? '<table style="width:100%;font-size:13px;border-collapse:collapse"><tr><th style="text-align:left;padding:5px 8px">时间</th><th style="text-align:left;padding:5px 8px">变更</th><th></th></tr>' + rows + '</table>'
+        : '<p class="desc">（还没有应用记录）</p>';
+      $('cf-history').querySelectorAll('button[data-rb]').forEach(function (b) {
+        b.addEventListener('click', function () {
+          if (!window.confirm('回滚该条变更？config / 关键词恢复后需重启桥接才完整生效。')) return;
+          api('/api/cfgmods/rollback', { method: 'POST', body: { id: b.dataset.rb } }).then(function () { toast('已回滚'); loadHistory(); }).catch(function (e2) { toast('回滚失败：' + e2.message); });
+        });
+      });
+    }).catch(function (e) { $('cf-history').innerHTML = '<p class="desc">加载失败：' + esc(e.message) + '</p>'; });
+  }
+  loadHistory();
+  return Promise.resolve();
+}
 function navCap() {
   var caps = state.caps || {};
   document.querySelectorAll('.nav-item').forEach(function (b) {
@@ -419,7 +520,7 @@ function navCap() {
 }
 function loadView(view) {
   state.view = view;
-  var titles = { overview: '总览', sessions: '会话与唤醒', usage: '用量与花费', kb: '知识库', memes: '表情包仓库', memory: '记忆', persona: '人格与提示词', features: '功能开关', plugins: '插件', settings: '白名单与安全', runtime: '省 token 与速度', ops: '运维' };
+  var titles = { overview: '总览', sessions: '会话与唤醒', usage: '用量与花费', kb: '知识库', memes: '表情包仓库', memory: '记忆', persona: '人格与提示词', features: '功能开关', plugins: '插件', cfgfiles: '配置文件投递', costs: '成本账本', settings: '白名单与安全', runtime: '省 token 与速度', ops: '运维' };
   $('page-title').textContent = titles[view] || view;
   document.querySelectorAll('.nav-item').forEach(function (b) { b.classList.toggle('active', b.dataset.view === view); });
   var box = $('view');
@@ -434,10 +535,50 @@ function loadView(view) {
   else if (view === 'persona') job = renderPersona();
   else if (view === 'features') job = renderFeatures();
   else if (view === 'plugins') job = renderPlugins();
+  else if (view === 'cfgfiles') job = renderCfgfiles();
+  else if (view === 'costs') job = renderCosts();
   else if (view === 'settings') job = renderSettings();
   else if (view === 'runtime') job = renderRuntime();
   else if (view === 'ops') job = renderOps();
   job.catch(function (err) { box.innerHTML = '<div class="card"><h3>加载失败</h3><p class="desc">' + esc(err.message) + '</p></div>'; });
+}
+
+// ── 成本账本 ────────────────────────────────────────────────────────────
+function renderCosts() {
+  var box = $('view');
+  box.innerHTML = '<div class="card"><h3>成本账本（按对话回合聚合）</h3>'
+    + '<p class="desc">口径：freshSessionPerTurn 下每个会话 = 一个对话回合；逐条按价目表计价。账本每月自动归档。</p>'
+    + '<div style="margin:8px 0"><select id="co-days" style="padding:6px 10px;border:1px solid #d8dee4;border-radius:8px">'
+    + '<option value="7">最近 7 天</option><option value="14" selected>最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option>'
+    + '</select> <button id="co-refresh" style="padding:6px 14px;border:1px solid #d8dee4;border-radius:8px;background:#fff;cursor:pointer">刷新</button></div>'
+    + '<div id="co-total"></div><div id="co-days-tbl" style="margin-top:12px"></div><div id="co-keys-tbl" style="margin-top:12px"></div></div>';
+  function yuan(v) { return '¥' + (Math.round(v * 100) / 100).toFixed(2); }
+  function load() {
+    var days = $('co-days').value;
+    $('co-total').innerHTML = '<p class="desc">计算中…</p>';
+    api('/api/costs?days=' + days).then(function (r) {
+      if (!r.ok) { $('co-total').innerHTML = '<p class="desc">读取失败：' + esc(r.error || '未知') + '</p>'; return; }
+      var t = r.total || {};
+      $('co-total').innerHTML = '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:6px">'
+        + '<div><div class="desc">总花费</div><div style="font-size:22px;font-weight:500">' + yuan(t.cost || 0) + '</div></div>'
+        + '<div><div class="desc">回合数</div><div style="font-size:22px;font-weight:500">' + (t.rounds || 0) + '</div></div>'
+        + '<div><div class="desc">缓存命中</div><div style="font-size:22px;font-weight:500">' + ((t.hit || 0) / 10000).toFixed(0) + ' 万 tok</div></div>'
+        + '<div><div class="desc">缓存未命中</div><div style="font-size:22px;font-weight:500">' + ((t.miss || 0) / 10000).toFixed(1) + ' 万 tok</div></div>'
+        + '<div><div class="desc">命中率</div><div style="font-size:22px;font-weight:500">' + ((t.hit + t.miss) ? Math.round(100 * t.hit / (t.hit + t.miss)) : 0) + '%</div></div>'
+        + '</div>';
+      var rows = (r.days || []).map(function (d) {
+        return '<tr><td>' + d.day + '</td><td>' + d.rounds + '</td><td>' + yuan(d.cost) + '</td><td>' + (d.rounds ? yuan(d.cost / d.rounds) : '-') + '</td><td>' + ((d.hit + d.miss) ? Math.round(100 * d.hit / (d.hit + d.miss)) : 0) + '%</td></tr>';
+      }).join('');
+      $('co-days-tbl').innerHTML = '<h3>按天</h3><table><tr><th>日期</th><th>回合</th><th>花费</th><th>均价/回合</th><th>命中率</th></tr>' + (rows || '<tr><td colspan="5">窗口内无数据</td></tr>') + '</table>';
+      var krows = (r.keys || []).map(function (k) {
+        return '<tr><td>' + esc(k.key) + '</td><td>' + k.rounds + '</td><td>' + yuan(k.cost) + '</td><td>' + ((k.miss || 0) / 10000).toFixed(1) + ' 万</td></tr>';
+      }).join('');
+      $('co-keys-tbl').innerHTML = '<h3>按会话（前 12）</h3><table><tr><th>会话</th><th>回合</th><th>花费</th><th>未命中 tok</th></tr>' + (krows || '<tr><td colspan="4">窗口内无数据</td></tr>') + '</table>';
+    }).catch(function (err) { $('co-total').innerHTML = '<p class="desc">加载失败：' + esc(err.message) + '</p>'; });
+  }
+  $('co-refresh').addEventListener('click', load);
+  $('co-days').addEventListener('change', load);
+  load();
 }
 
 // ── 总览 ────────────────────────────────────────────────────────────────

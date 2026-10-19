@@ -14,6 +14,77 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { spawn } from 'node:child_process';
+import { priceUsage, resolvePriceTable } from './model-prices.js';
+
+// ── 配置文件投递（新后台「配置文件」模块）：识别 / 差异 / 深合并 / 历史 ──────
+// 设计：文件丢进来 → 自动识别归属（config 合并 / 人设替换 / 关键词清单）→ 先备份再写。
+// 原则：consoleToken 等安全字段拒绝经此通道修改；人设替换必须显式确认（confirmRole）；
+//       历史只追加不覆盖；config 类变更写入后尽力热更内存 cfg（与白名单编辑同一做法），
+//       但启动时读一次的字段要重启桥接才完整生效 —— 返回值里用 needsRestart 如实标注。
+const CFGMOD_CONFIG_KEYS = new Set(['dsh', 'socialV2', 'social', 'allow', 'deny', 'ownerQQ', 'role', 'snowluma', 'consolePort', 'sessionCwd', 'agentPreset', 'workspaceTitle', 'allowAllWhenEmpty', 'ackMessage', 'sendDelayMs', 'questionTimeoutMs', 'pricing', 'security', 'slang']);
+const CFGMOD_V2_KEYS = new Set(['enabled', 'autoReplyCheckMs', 'agentPreset', 'provideRecommendations', 'tools', 'wake', 'thinkingFiller', 'send', 'wait', 'sticker', 'memes', 'qzone', 'peakQuiet', 'dshQueue', 'groupSafety', 'sleep', 'diary', 'mood', 'groupRecap', 'broadcast', 'voice', 'proactive', 'feedback', 'memoryDb', 'context', 'account', 'moe', 'express', 'usage', 'grump', 'concurrency', 'slang', 'security']);
+
+function cfgmodIdentify(name, text) {
+  const t = String(text ?? '');
+  const trimmed = t.trim();
+  if (!trimmed) return { target: 'empty', ok: false, error: '空文件' };
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    let obj;
+    try { obj = JSON.parse(trimmed); } catch (e) { return { target: 'invalid-json', ok: false, error: 'JSON 解析失败：' + e.message }; }
+    if (Array.isArray(obj) || !obj || typeof obj !== 'object') return { target: 'unknown-json', ok: false, error: '不支持顶层数组/标量的 JSON' };
+    const top = Object.keys(obj);
+    if (top.includes('consoleToken')) return { target: 'refused', ok: false, error: '拒绝：文件试图修改 consoleToken（安全字段请走「白名单与安全」页）' };
+    const direct = top.filter((k) => CFGMOD_CONFIG_KEYS.has(k));
+    const v2only = top.length > 0 && top.every((k) => CFGMOD_V2_KEYS.has(k));
+    if (direct.length || v2only) return { target: 'config-merge', ok: true, topKeys: top, scope: (v2only && !direct.length) ? 'socialV2' : 'root' };
+    return { target: 'unknown-json', ok: false, error: '无法识别的 JSON：顶层键（' + top.slice(0, 8).join(', ') + '）不属于 config.json / socialV2 结构' };
+  }
+  const mdHeadings = (trimmed.match(/^#{1,3}\s+\S/gm) || []).length;
+  if (/\.(md|markdown)$/i.test(name) || mdHeadings >= 1) return { target: 'role-md', ok: true, needsConfirm: true };
+  const lines = trimmed.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (lines.length && lines.length <= 60 && lines.every((l) => l.length <= 30 && !/[；;{}]/.test(l))) return { target: 'keywords-list', ok: true, count: lines.length };
+  return { target: 'unknown-text', ok: false, error: '无法识别：不是 config JSON、人设 Markdown，也不是关键词清单（每行一个、≤30 字）' };
+}
+
+function cfgmodDeepMerge(base, patch) {
+  const out = (base && typeof base === 'object' && !Array.isArray(base)) ? { ...base } : {};
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (v && typeof v === 'object' && !Array.isArray(v) && out[k] && typeof out[k] === 'object' && !Array.isArray(out[k])) out[k] = cfgmodDeepMerge(out[k], v);
+    else out[k] = v;
+  }
+  return out;
+}
+
+function cfgmodDeepMergeInto(target, patch) {
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (v && typeof v === 'object' && !Array.isArray(v) && target[k] && typeof target[k] === 'object' && !Array.isArray(target[k])) cfgmodDeepMergeInto(target[k], v);
+    else target[k] = v;
+  }
+  return target;
+}
+
+function cfgmodDiff(a, b, prefix = '', out = [], depth = 0) {
+  if (depth > 6) return out;
+  for (const k of Object.keys(b || {})) {
+    if (out.length >= 40) { out.push('…（更多变更省略）'); return out; }
+    const p = prefix ? prefix + '.' + k : k;
+    const bv = b[k];
+    const av = a ? a[k] : undefined;
+    if (JSON.stringify(av) === JSON.stringify(bv)) continue;
+    if (bv && typeof bv === 'object' && !Array.isArray(bv) && av && typeof av === 'object' && !Array.isArray(av)) cfgmodDiff(av, bv, p, out, depth + 1);
+    else out.push(p + '：' + (av === undefined ? '（新增）' : JSON.stringify(av)) + ' → ' + JSON.stringify(bv).slice(0, 80));
+  }
+  return out;
+}
+
+function cfgmodReadHistory(file) {
+  try { const a = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(a) ? a : []; } catch { return []; }
+}
+
+function cfgmodWriteHistory(file, arr) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(arr.slice(-60), null, 2) + '\n', 'utf8');
+}
 
 export function createConsoleServer(S) {
   const {
@@ -1742,6 +1813,217 @@ export function createConsoleServer(S) {
           return;
         }
         // ── 二代仿真模式（reserved2）内部 Agent API ─────────────────────────
+        // ── 配置文件投递（新后台「配置文件」模块）────────────────────────────
+        if (req.method === 'POST' && url.pathname === '/api/cfgmods/inspect') {
+          const body = await readBody();
+          const files = Array.isArray(body?.files) ? body.files.slice(0, 10) : [];
+          const results = files.map((f) => {
+            const name = String(f?.name || 'file');
+            const content = String(f?.content ?? '');
+            const id = cfgmodIdentify(name, content);
+            const r = { name, ...id, chars: content.length };
+            if (id.ok && id.target === 'config-merge') {
+              let patch;
+              try { patch = JSON.parse(content.trim()); } catch (e) { r.ok = false; r.error = 'JSON 解析失败：' + e.message; return r; }
+              const cur = readConfigObject(path.join(ROOT, 'config.json'));
+              const base = id.scope === 'socialV2' ? (cur.socialV2 ?? {}) : cur;
+              r.effect = '深合并进 config.json' + (id.scope === 'socialV2' ? ' 的 socialV2 段' : '') + '；已尽力热更内存，重启桥接后完整生效';
+              r.changes = cfgmodDiff(base, patch).map((s) => s.startsWith('…') ? s : (id.scope === 'socialV2' ? 'socialV2.' + s : s));
+              if (!r.changes.length) r.changes = ['（与当前配置无差异）'];
+            } else if (id.ok && id.target === 'role-md') {
+              const lf = content.replace(/\r\n/g, '\n');
+              const sections = (lf.match(/^##\s/gm) || []).length;
+              r.sections = sections;
+              r.charsAfter = lf.length;
+              r.effect = '替换 roles 人设文件（CRLF 自动规范化为 LF），热生效';
+              if (/\r\n/.test(content)) r.note = '已自动把 CRLF 规范化为 LF（人设解析依赖 LF）';
+              if (sections < 1) { r.ok = false; r.error = '人设至少需要 1 个 "## " 小节（parseRoleSections 依赖），当前 0 个'; }
+              else if (lf.length > 30000) { r.ok = false; r.error = '超过 role.maxInjectChars=30000 注入上限（当前 ' + lf.length + ' 字符）'; }
+            } else if (id.ok && id.target === 'keywords-list') {
+              const lines = content.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+              const cur = (cfg.socialV2?.wake?.recommendedKeywords) || [];
+              r.effect = '合并进 socialV2.wake.recommendedKeywords（去重，上限 40）';
+              const fresh = lines.filter((l) => !cur.includes(l));
+              r.changes = fresh.length ? ['将新增 ' + fresh.length + ' 个关键词：' + fresh.join('、')] : ['（关键词均已存在，无变化）'];
+            }
+            return r;
+          });
+          sendJson({ ok: results.every((r) => r.ok), results });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/cfgmods/apply') {
+          const body = await readBody();
+          const files = Array.isArray(body?.files) ? body.files.slice(0, 10) : [];
+          const confirmRole = body?.confirmRole === true;
+          const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14) + '-' + String(Date.now()).slice(-4);
+          const configFile = path.join(ROOT, 'config.json');
+          const results = [];
+          for (const f of files) {
+            const name = String(f?.name || 'file');
+            const content = String(f?.content ?? '');
+            const id = cfgmodIdentify(name, content);
+            const r = { name, target: id.target, ok: false };
+            try {
+              if (!id.ok) { r.error = id.error; results.push(r); continue; }
+              if (id.target === 'config-merge') {
+                const file = readConfigObject(configFile); // fail-fast：配置损坏绝不回写
+                const patch = JSON.parse(content.trim());
+                const backup = configFile + '.bak-cfgmod-' + stamp;
+                fs.writeFileSync(backup, JSON.stringify(file, null, 2) + '\n', 'utf8');
+                const merged = cfgmodDeepMerge(file, patch);
+                atomicWriteJson(configFile, merged);
+                const livePatch = id.scope === 'socialV2' ? { socialV2: cfgmodDeepMerge(cfg.socialV2 ?? {}, patch) } : patch;
+                cfgmodDeepMergeInto(cfg, livePatch);
+                r.ok = true; r.backup = backup; r.targetPath = configFile;
+                r.changes = cfgmodDiff(file, merged);
+                if (!r.changes.length) r.changes = ['（与当前配置无差异，仅刷新落盘）'];
+                r.effect = '已写入 config.json 并尽力热更内存；启动时读一次的字段需重启桥接';
+                r.needsRestart = true;
+              } else if (id.target === 'keywords-list') {
+                const file = readConfigObject(configFile);
+                const cur = file.socialV2?.wake?.recommendedKeywords;
+                if (!Array.isArray(cur)) throw new Error('config.json 缺少 socialV2.wake.recommendedKeywords 数组，无法合并');
+                const lines = content.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+                const merged = [...cur];
+                for (const l of lines) if (!merged.includes(l) && merged.length < 40) merged.push(l);
+                const backup = configFile + '.bak-cfgmod-' + stamp;
+                fs.writeFileSync(backup, JSON.stringify(file, null, 2) + '\n', 'utf8');
+                file.socialV2.wake.recommendedKeywords = merged;
+                atomicWriteJson(configFile, file);
+                if (cfg.socialV2?.wake) cfg.socialV2.wake.recommendedKeywords = merged;
+                r.ok = true; r.backup = backup; r.targetPath = configFile;
+                const fresh = lines.filter((l) => !cur.includes(l));
+                r.changes = fresh.length ? ['新增 ' + fresh.length + ' 个关键词：' + fresh.join('、')] : ['（关键词均已存在）'];
+                r.effect = '已合并进 socialV2.wake.recommendedKeywords；重启桥接后完整生效';
+                r.needsRestart = true;
+              } else if (id.target === 'role-md') {
+                if (!confirmRole) throw new Error('替换人设需要显式确认（勾选「我确认替换人设文件」）');
+                const rolesDir = path.join(ROOT, 'roles');
+                let rf = null;
+                const want = String(f?.roleFile || '').trim();
+                if (want) {
+                  const cand = path.join(rolesDir, path.basename(want));
+                  if (!cand.startsWith(rolesDir + path.sep) || !/\.md$/i.test(cand)) throw new Error('roleFile 非法：' + want);
+                  if (!fs.existsSync(cand)) throw new Error('roles/ 下不存在 ' + path.basename(want));
+                  rf = cand;
+                } else {
+                  let mds = [];
+                  try { mds = fs.readdirSync(rolesDir).filter((x) => /^[^.].*\.md$/i.test(x)); } catch { }
+                  if (mds.length === 1) rf = path.join(rolesDir, mds[0]);
+                  else rf = mds.length ? path.join(rolesDir, mds.find((x) => x.includes('蓝色大肥鱼')) || '') : null;
+                }
+                if (!rf || !fs.existsSync(rf)) throw new Error('无法定位人设文件（roles/ 下有多个 .md 时请在文件项指定 roleFile）');
+                const lf = content.replace(/\r\n/g, '\n');
+                if ((lf.match(/^##\s/gm) || []).length < 1) throw new Error('人设至少需要 1 个 "## " 小节');
+                if (lf.length > 30000) throw new Error('超过 role.maxInjectChars=30000 注入上限');
+                const backup = rf + '.bak-cfgmod-' + stamp;
+                fs.writeFileSync(backup, fs.readFileSync(rf, 'utf8'), 'utf8');
+                fs.writeFileSync(rf, lf, 'utf8');
+                r.ok = true; r.backup = backup; r.targetPath = rf;
+                r.changes = ['人设 ' + path.basename(rf) + ' 已替换（' + lf.length + ' 字符，LF 规范化）'];
+                r.effect = '人设已替换，热生效（下一回合起使用新人设）';
+                r.needsRestart = false;
+              } else {
+                r.error = id.error || '未支持的目标';
+              }
+            } catch (error) {
+              r.error = error?.message ?? String(error);
+            }
+            results.push(r);
+          }
+          const okAll = results.every((r) => r.ok);
+          let historyId = null;
+          if (results.some((r) => r.ok)) {
+            historyId = 'cfgmod-' + Date.now();
+            const h = cfgmodReadHistory(path.join(ROOT, 'state', 'cfgmods-history.json'));
+            h.push({ id: historyId, time: new Date().toISOString(), files: results.map((r) => ({ name: r.name, target: r.target, targetPath: r.targetPath || null, backup: r.backup || null, ok: r.ok })) });
+            cfgmodWriteHistory(path.join(ROOT, 'state', 'cfgmods-history.json'), h);
+          }
+          log(`控制台：配置文件投递 ${results.filter((r) => r.ok).length}/${results.length} 成功（${results.map((r) => r.name + '→' + r.target).join('; ')}）`);
+          sendJson({ ok: okAll, results, historyId, needsRestart: results.some((r) => r.ok && r.needsRestart) });
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/costs') {
+          // [成本面板 2026-10-19] 按 (sid) ≈ 对话回合聚合（freshSessionPerTurn 下每回合新会话），
+          // 逐条按 model+时间用 model-prices 价目表计价；days 参数控制窗口（默认 14，上限 60）。
+          const days = Math.min(60, Math.max(1, Number(url.searchParams.get('days')) || 14));
+          try {
+            const file = path.join(ROOT, 'state', 'token-usage.jsonl');
+            const raw = fs.readFileSync(file, 'utf8');
+            const table = resolvePriceTable(cfg?.pricing);
+            const dayCut = new Date(); dayCut.setHours(0, 0, 0, 0);
+            const startMs = dayCut.getTime() - (days - 1) * 86400000;
+            const byDay = new Map(); const byKey = new Map();
+            const roundDay = new Map();
+            const roundKey = new Map(); // sid -> key：回合归属唯一会话，per-key 回合计数用
+            const total = { cost: 0, rounds: 0, miss: 0, hit: 0, out: 0 };
+            for (const line of raw.split('\n')) {
+              if (!line) continue;
+              let j; try { j = JSON.parse(line); } catch { continue; }
+              const t = Number(j.t || 0);
+              if (!t || t < startMs) continue;
+              const b = j.b || {};
+              const buckets = { cacheMiss: b.cacheMiss || 0, cacheHit: b.cacheHit || 0, cacheWrite: b.cacheWrite || 0, output: b.output || 0, reasoning: b.reasoning || 0 };
+              const priced = priceUsage(buckets, { model: j.model, at: t, table });
+              // priceUsage 返回 { rates, cost: {cacheHit.., total} } —— 取 cost.total（数值，单位元）
+              const cost = Number(priced?.cost?.total) || 0;
+              const dt = new Date(t);
+              const dayStr = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+              let d = byDay.get(dayStr);
+              if (!d) { d = { day: dayStr, rounds: 0, cost: 0, miss: 0, hit: 0, out: 0 }; byDay.set(dayStr, d); }
+              d.cost += cost; d.miss += buckets.cacheMiss; d.hit += buckets.cacheHit; d.out += buckets.output + buckets.reasoning;
+              if (j.sid && !roundDay.has(j.sid)) { roundDay.set(j.sid, dayStr); d.rounds += 1; }
+              const kKey = j.key || '(未知)';
+              let k = byKey.get(kKey);
+              if (!k) { k = { key: kKey, rounds: 0, cost: 0, miss: 0 }; byKey.set(kKey, k); }
+              k.cost += cost; k.miss += buckets.cacheMiss;
+              if (j.sid && !roundKey.has(j.sid)) {
+                roundKey.set(j.sid, kKey);
+                k.rounds += 1;
+              }
+              total.cost += cost; total.miss += buckets.cacheMiss; total.hit += buckets.cacheHit; total.out += buckets.output + buckets.reasoning;
+            }
+            const daysArr = [...byDay.values()].map((d) => ({ ...d, cost: Math.round(d.cost * 100) / 100 })).sort((a, b) => (a.day < b.day ? -1 : 1));
+            const keysArr = [...byKey.values()].map((k) => ({ ...k, cost: Math.round(k.cost * 100) / 100 })).sort((a, b) => b.cost - a.cost).slice(0, 12);
+            total.rounds = roundDay.size;
+            total.cost = Math.round(total.cost * 100) / 100;
+            sendJson({ ok: true, days: daysArr, keys: keysArr, total, generatedAt: new Date().toISOString() });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message || String(error) });
+          }
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/cfgmods/history') {
+          const h = cfgmodReadHistory(path.join(ROOT, 'state', 'cfgmods-history.json'));
+          sendJson({ ok: true, history: h.slice(-40).reverse() });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/cfgmods/rollback') {
+          const body = await readBody();
+          const id = String(body?.id || '');
+          const histFile = path.join(ROOT, 'state', 'cfgmods-history.json');
+          const h = cfgmodReadHistory(histFile);
+          const entry = h.find((e) => e.id === id);
+          if (!entry) { sendJson({ ok: false, error: '没有这条历史记录：' + id }, 404); return; }
+          const results = [];
+          for (const f of entry.files) {
+            if (!f.ok || !f.backup || !f.targetPath) { results.push({ name: f.name, ok: false, error: '该条没有可回滚的备份' }); continue; }
+            try {
+              const bak = fs.readFileSync(f.backup, 'utf8');
+              if (f.target === 'role-md') fs.writeFileSync(f.targetPath, bak.replace(/\r\n/g, '\n'), 'utf8');
+              else atomicWriteJson(f.targetPath, JSON.parse(bak));
+              results.push({ name: f.name, ok: true, targetPath: f.targetPath });
+            } catch (error) {
+              results.push({ name: f.name, ok: false, error: error?.message ?? String(error) });
+            }
+          }
+          h.push({ id: 'rollback-' + Date.now(), time: new Date().toISOString(), rollbackOf: id, files: results.map((r) => ({ name: r.name, target: 'rollback', targetPath: null, backup: null, ok: r.ok })) });
+          cfgmodWriteHistory(histFile, h);
+          log(`控制台：配置文件回滚 ${id}（${results.filter((r) => r.ok).length}/${results.length} 成功）`);
+          sendJson({ ok: results.every((r) => r.ok), results, needsRestart: true });
+          return;
+        }
+
         if (req.method === 'GET' && url.pathname === '/api/socialV2/config') {
           sendJson({ ok: true, config: cfg.socialV2 ?? {} });
           return;

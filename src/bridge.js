@@ -3040,6 +3040,98 @@ async function main() {
     // 默认只允许把 launch token 交给回环地址；远程 DSH 需要显式 opt-in（见 dsh-client.ensureAuth）。
     allowRemote: cfg.dsh.allowRemote === true
   });
+
+  // ── [隐患根治 2026-10-19] DSH 内核端口自动跟随 + 待机恢复核对 ────────────────
+  // 背景：桌面壳每次重启会重选内核端口（3080↔3081），旧流程要手工改 config.json 对齐；
+  // 待机（S0 Modern Standby）恢复后内核也可能换端口。这里周期核对：
+  //   - 读 ~/.dsh/profiles/<profile>/.harness.pid 第 2 行（内核监听端口）
+  //   - 当前 baseUrl 连得上 → 不动；连不上且 harness 端口活着 → 自动重指 api.baseUrl
+  //     （会话映射不用手工清：DSH 侧会话若已不在，ensureChatModel 的 not-found 路径会自动退役重建）
+  //   - 进程被待机冻结超过 4 分钟（tick 间隔异常拉长）→ 视为刚恢复，立即核对一次
+  // 重指是安全的：api.baseUrl 在每次请求时实时读取（dsh-client.js），cookie 由 ensureAuth 按当前基址重铸。
+  const dshPortWatch = { lastRunAt: Date.now() };
+  function harnessPortCandidate() {
+    try {
+      const profile = String(cfg.dsh?.profile || 'tauri');
+      const raw = fs.readFileSync(path.join(os.homedir(), '.dsh', 'profiles', profile, '.harness.pid'), 'utf8');
+      const port = parseInt(String(raw).split(/\r?\n/)[1], 10);
+      return Number.isFinite(port) && port > 0 && port < 65536 ? port : 0;
+    } catch { return 0; }
+  }
+  async function dshEndpointAlive(url, timeoutMs = 2500) {
+    try {
+      const res = await safeFetch(url + '/api/status', { signal: AbortSignal.timeout(timeoutMs) });
+      return res.status > 0; // 任何 HTTP 状态（含 401/404）都算内核活着
+    } catch { return false; }
+  }
+  async function dshPortWatchTick() {
+    const port = harnessPortCandidate();
+    if (!port) return;
+    let curPort = '';
+    try { curPort = new URL(api.baseUrl).port; } catch { return; }
+    if (String(port) === String(curPort)) return;
+    if (await dshEndpointAlive(api.baseUrl)) return; // 现端口还活着，别乱动
+    const next = `http://127.0.0.1:${port}`;
+    if (!(await dshEndpointAlive(next))) return;
+    api.baseUrl = next;
+    try { api.cookie = null; } catch { /* 让 ensureAuth 按新基址重铸 cookie */ }
+    cfg.dsh.baseUrl = next;
+    log(`⚠️ [端口跟随] DSH 内核从 ${curPort} 漂移到 ${port}，已自动重指（旧会话若已随内核消失，走 not-found 自愈重建）`);
+    appendActivity(`[端口跟随] DSH 内核端口 ${curPort} -> ${port}`);
+  }
+  function startDshPortWatchdog() {
+    if (cfg.dsh?.portFollow?.enabled === false) return;
+    const interval = Math.max(15000, Number(cfg.dsh?.portFollow?.intervalMs) || 60000);
+    const timer = setInterval(async () => {
+      const now = Date.now();
+      const frozenMs = now - dshPortWatch.lastRunAt;
+      dshPortWatch.lastRunAt = now;
+      try {
+        if (frozenMs > 4 * 60000) log(`[端口跟随] 进程冻结 ${Math.round(frozenMs / 60000)}min（疑似待机）后恢复，立即核对内核端口`);
+        await dshPortWatchTick();
+      } catch { /* 单次核对失败不影响下一轮 */ }
+    }, interval);
+    timer.unref?.();
+    log(`[端口跟随] 已启动（每 ${Math.round(interval / 1000)}s 核对，端口来源 ~/.dsh/profiles/${cfg.dsh?.profile || 'tauri'}/.harness.pid 第 2 行）`);
+  }
+
+  // ── [数据退役 2026-10-19] 每日维护：消息库过期清理 + token 账本轮转归档 ──────
+  // 每 24h 真跑一次（进程内计时），启动后 2 分钟先跑一遍。bridge.log 已有 capped
+  // logger（2000 行上限）不重复管。账本归档 = 改名加日期后缀，进程按次追加写入不断 fd。
+  const maintenanceState = { lastRunAt: 0 };
+  function rotateFileIfBig(file, label, maxBytes = 8 * 1024 * 1024) {
+    try {
+      const st = fs.statSync(file);
+      if (!st.isFile() || st.size < maxBytes) return;
+      const stamp = localDayString(0) + '-' + String(Math.floor(st.mtimeMs / 1000) % 1000000);
+      fs.renameSync(file, `${file}.${stamp}`);
+      log(`[维护] ${label}超过 ${Math.round(maxBytes / 1048576)}MB，已归档为 ${path.basename(file)}.${stamp}`);
+    } catch { /* 文件不存在/被占用，下次再试 */ }
+  }
+  function maintenanceDailyV2() {
+    const now = Date.now();
+    if (now - maintenanceState.lastRunAt < 86400000) return;
+    maintenanceState.lastRunAt = now;
+    try {
+      const mdb = memoryDb();
+      if (mdb && typeof mdb.pruneMessages === 'function') {
+        const keepDays = Number(cfg.socialV2?.retention?.messagesKeepDays) || 180;
+        const removed = mdb.pruneMessages(keepDays);
+        if (removed) log(`[维护] messages 库清理 ${removed} 条（保留 ${keepDays} 天，情景摘要已固化在 long-memory.db 不受影响）`);
+      }
+    } catch (error) {
+      log('[维护] messages 清理失败:', error?.message || error);
+    }
+    rotateFileIfBig(TOKEN_USAGE_FILE, 'token 账本');
+  }
+  function startDailyMaintenance() {
+    setTimeout(() => {
+      try { maintenanceDailyV2(); } catch { /* */ }
+      const timer = setInterval(() => { try { maintenanceDailyV2(); } catch { /* */ } }, 3600000);
+      timer.unref?.();
+    }, 120000).unref?.();
+  }
+
   // DSH 的模型目录 RPC：0.1.5 是 `session/modelCatalog`。**不能走基类门面**
   // `api.sessions.modelCatalog` —— 桥接钉住的 `@deepseek-ai/dsh-host-apiproxy@0.1.1-rc.2`
   // 的 sessions 门面里根本没有这个方法（只有 `models` → 已下线的 `session/models`），
@@ -6070,17 +6162,44 @@ async function main() {
   // 返回 'applied' | 'not-found' | 'failed'。
   // 'not-found' 表示 DSH 侧会话已经不存在（DSH 重启、异常退出、归档竞态），
   // 本地映射已失效，调用方必须退役重建，否则每条消息都会对着一个不存在的会话重试。
+  // ── [免费车道 2026-10-19] 群聊走免费模型，私聊（尤其主人）保持付费车道 ───────
+  // config: socialV2.freeLane = { enabled, provider, model, failThreshold, cooldownMs }
+  // 熔断：免费模型的 selectModel 连续失败 failThreshold 次 → 回退付费车道 cooldownMs
+  // （默认 30 分钟）并递增 modelSelectionEpoch 让存量群会话立刻重应用付费模型；
+  // 冷却结束后新会话自然回到免费车道。可用性预检读 our-free-model 插件的 availability.json。
+  const freeLaneState = { fails: 0, cooldownUntil: 0 };
+  function laneModelFor(sessionId) {
+    const fallback = { provider: String(cfg.dsh?.provider || 'deepseek-official'), model: String(cfg.dsh?.model || 'longcat-2.5-preview-free') };
+    const lane = cfg.socialV2?.freeLane;
+    if (!lane?.enabled) return fallback;
+    const key = String(reverse.get(sessionId) || '');
+    if (!key.startsWith('group:')) return fallback; // 私聊永远付费（主人体验优先）
+    if (Date.now() < freeLaneState.cooldownUntil) return fallback;
+    const provider = String(lane.provider || 'our-free-model');
+    const model = String(lane.model || 'nemotron-3-ultra-free');
+    if (!provider || !model) return fallback;
+    // 可用性预检：插件探活报告明确不可用/限流的模型直接走付费，不浪费一次失败
+    try {
+      const avail = JSON.parse(fs.readFileSync(path.join(ROOT, '..', 'our-free-model', 'availability.json'), 'utf8'));
+      const state = avail?.results?.[model]?.state;
+      if (state && state !== 'available') return fallback;
+    } catch { /* 探活文件读不到不拦路（可能是首次还没生成） */ }
+    return { provider, model, free: true };
+  }
+
   async function ensureChatModel(sessionId) {
     if (modelAppliedSessions.get(sessionId) === modelSelectionEpoch) return 'applied';
-    const provider = String(cfg.dsh?.provider || 'deepseek-official');
-    const model = String(cfg.dsh?.model || 'longcat-2.5-preview-free');
+    const sel = laneModelFor(sessionId);
+    const provider = sel.provider;
+    const model = sel.model;
     const effort = String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT);
     let lastError = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
         const result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: effort }), 'session.selectModel');
         modelAppliedSessions.set(sessionId, modelSelectionEpoch);
-        log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})`);
+        if (sel.free) freeLaneState.fails = 0;
+        log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})${sel.free ? '［免费车道］' : ''}`);
         return 'applied';
       } catch (error) {
         lastError = error;
@@ -6093,6 +6212,18 @@ async function main() {
       // 终态失败：记下 epoch，避免退役前（或退役失败时）被反复重试刷屏。
       modelAppliedSessions.set(sessionId, modelSelectionEpoch);
       return 'not-found';
+    }
+    // [免费车道熔断] 免费模型连续挂 N 次 → 回退付费车道一段时间
+    if (sel.free) {
+      freeLaneState.fails += 1;
+      const threshold = Math.max(1, Number(cfg.socialV2?.freeLane?.failThreshold) || 3);
+      if (freeLaneState.fails >= threshold) {
+        const cooldownMs = Math.max(60000, Number(cfg.socialV2?.freeLane?.cooldownMs) || 1800000);
+        freeLaneState.cooldownUntil = Date.now() + cooldownMs;
+        freeLaneState.fails = 0;
+        modelSelectionEpoch += 1; // 让已切到免费模型的群会话在下一条消息重新应用付费模型
+        log(`⚠️ [免费车道] 免费模型连续失败 ${threshold} 次，回退付费车道 ${Math.round(cooldownMs / 60000)} 分钟（epoch+1 触发存量会话重应用）`);
+      }
     }
     return 'failed';
   }
@@ -7891,6 +8022,9 @@ async function main() {
   if (cfg.social?.enabled !== false) {
     startSocialLoop();
   }
+  // [隐患根治 2026-10-19] 内核端口自动跟随 + 每日数据退役
+  try { startDshPortWatchdog(); } catch (error) { log('[端口跟随] 启动失败:', error?.message || error); }
+  try { startDailyMaintenance(); } catch (error) { log('[维护] 启动失败:', error?.message || error); }
 
   // 当前角色扮演提示：读 state/current-role.json + roles/<角色>.md，
   // 由桥接注入到 QQ 群消息（群友无法通过对话修改，只能由管理端写该文件）。
