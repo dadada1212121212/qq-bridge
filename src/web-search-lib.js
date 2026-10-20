@@ -977,10 +977,12 @@ export async function searchWeb(rawQuery, deps = {}) {
   const cleanErrors = [...new Set(errors)].filter((e) => !(noisy && noisy.test(e)) && !/: 冷却中/.test(e));
 
   // 标签要反映「结果实际来自哪些源」：首成功源可能只是噪声，真正答对的是后到的源。
-  const usedSources = [...new Set(ranked.map((r) => r.source).filter(Boolean))];
+  // [时效标注 2026-10-20] 每条结果抽发布时间；时效性查询若全是旧内容，明确警告。
+  const dated = annotateDates(ranked, started);
+  const usedSources = [...new Set(dated.map((r) => r.source).filter(Boolean))];
   const payload = {
     query,
-    results: ranked.slice(0, limit),
+    results: dated.slice(0, limit),
     source: usedSources.join('+') || main.firstSource,
     cached: false,
     tookMs: Date.now() - started,
@@ -988,10 +990,69 @@ export async function searchWeb(rawQuery, deps = {}) {
   };
   if (note) payload.note = note;
   if (lowConfidence) payload.lowConfidence = true;
+  // 只有"时效性查询"（价格/比分/新闻…）才提示旧结果：问「这个梗哪来的」时
+  // 五年前的百科条目完全正常，警告反而是噪音。
+  if (ttlForQuery(query) === TTL_FAST_MS) {
+    const stamped = payload.results.filter((r) => Number(r.dateTs) > 0);
+    const staleAfter = 180 * 86400000;
+    if (stamped.length && stamped.every((r) => started - Number(r.dateTs) > staleAfter)) {
+      const oldest = stamped.reduce((a, r) => (Number(r.dateTs) < Number(a.dateTs) ? r : a), stamped[0]);
+      payload.staleHint = `这批结果的日期都比较旧（最早 ${oldest.date}），可能不是最新情况。想要新的就换个更具体的词（加年份/月份/「最新」）再搜一次。`;
+    }
+  }
   // 只缓存"相关且非兜底"的结果：空结果是瞬时失败（限流/超时），低相关兜底也可能只是因为
   // 那一刻源被限流；两者缓存下来都会让她十分钟内反复收到同一批差结果，连重试的机会都没有。
   if (cache && payload.results.length && !lowConfidence) cache.set(cacheKey, { ...payload, tookMs: 0 });
   return payload;
+}
+
+/**
+ * 从标题/摘要里抽发布时间。
+ *
+ * 为什么要做（2026-10-20）：引擎给的结果只有标题和摘要，**没有发布时间**。
+ * 问她「最近那个事」，很可能拿回一篇三年前的页面当新闻答，而且看起来毫无破绽。
+ * 抽出来标在结果上，至少能让她自己判断"这条是不是太旧了"。
+ *
+ * 只认两类：绝对日期（2023-05-12 / 2023年5月 / 2023/5/12）和相对时间（3天前 / 2小时前）。
+ * 误判防护：年月必须合法、且不能晚于明天；「2000-3000元」这种会因月份非法被丢掉。
+ */
+export function extractDate(text, now = Date.now()) {
+  const s = String(text || '');
+  const abs = s.match(/(20\d{2})\s*[-/年.]\s*(\d{1,2})(?:\s*[-/月.]\s*(\d{1,2}))?/);
+  if (abs) {
+    const y = Number(abs[1]);
+    const m = Number(abs[2]);
+    const d = Number(abs[3] || 1);
+    if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+      const ts = Date.UTC(y, m - 1, d);
+      if (ts <= now + 86400000) {
+        const mm = String(m).padStart(2, '0');
+        const label = abs[3] ? `${y}-${mm}-${String(d).padStart(2, '0')}` : `${y}-${mm}`;
+        return { y, m, d, ts, label };
+      }
+    }
+  }
+  const rel = s.match(/(\d{1,3})\s*(分钟|小时|天|周|个?月|年)前/);
+  if (rel) {
+    const n = Number(rel[1]);
+    const unit = rel[2];
+    const mult = unit === '分钟' ? 60000
+      : unit === '小时' ? 3600000
+        : unit === '天' ? 86400000
+          : unit === '周' ? 7 * 86400000
+            : unit.includes('月') ? 30 * 86400000 : 365 * 86400000;
+    return { ts: now - n * mult, label: `${n}${unit}前` };
+  }
+  return null;
+}
+
+/** 给一批结果补上 date / dateTs（抽不到就原样留着，不编日期）。 */
+export function annotateDates(list, now = Date.now()) {
+  return (Array.isArray(list) ? list : []).map((r) => {
+    if (!r) return r;
+    const d = extractDate(`${r.title || ''} ${r.snippet || ''}`, now);
+    return d ? { ...r, date: d.label, dateTs: d.ts } : r;
+  });
 }
 
 /** 把搜索结果渲染成给模型看的紧凑文本（省 token：一行一条）。 */
@@ -1009,8 +1070,10 @@ export function renderSearchResult(payload, opts = {}) {
   const head = `${payload.query}（来自 ${payload.source}${payload.cached ? '，缓存' : ''}）`;
   const lines = list.map((r, i) => {
     const sn = String(r.snippet || '').slice(0, 90);
-    return `${i + 1}. ${r.title}${sn ? ` — ${sn}` : ''}`;
+    const dt = r.date ? `（${r.date}）` : '';
+    return `${i + 1}. ${r.title}${dt}${sn ? ` — ${sn}` : ''}`;
   });
+  const stale = payload?.staleHint ? `\n⚠ ${payload.staleHint}` : '';
   const note = payload?.note ? `\n⚠ ${payload.note}` : '';
-  return `${head}\n${lines.join('\n')}${note}`;
+  return `${head}\n${lines.join('\n')}${stale}${note}`;
 }

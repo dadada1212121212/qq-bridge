@@ -47,6 +47,7 @@ export function createWakePrompt(S) {
     getSocialV2State,
     groupRecapTargetDayV2,
     historyRecallV2,
+    linkDigestLineV2,
     longMemoryRecallV2,
     longMemorySelfCheckV2,
     memoryDb,
@@ -320,6 +321,10 @@ export function createWakePrompt(S) {
     // [成本感知 2026-10-19] 今天开销超预算才出现的一句话（<80% 预算时为空，一个字不多说）。
     let spendLine = '';
     try { spendLine = spendLineV2(); } catch (e) { log('[成本] 水位段生成失败：' + (e?.message || e)); }
+    // [链接顺手读 2026-10-20] 刚才有人贴了链接、正文已经抓好 → 把摘要直接摆到她眼前。
+    // 抓不到/还在路上就是空串（不占一个字，也不会让她以为"有人发了东西"）。
+    let linkLine = '';
+    try { linkLine = linkDigestLineV2(key); } catch (e) { log('[链接] 摘要段生成失败：' + (e?.message || e)); }
     // [关系] 只注入「此刻在场的几个人」跟她的关系（好感/档位/称呼/约定/最近的共同回忆）。
     const relationLine = relationLineV2(key);
     // [B 口癖画像] 她自己说话的习惯（常用词 / 句尾 / 平均句长），从她真发过的话里统计。
@@ -387,7 +392,7 @@ export function createWakePrompt(S) {
     const slowSeg = moeLine + wakeLine + recapLine + dbLine + diaryLine + styleLine + ironLine;
     const volatileSeg = moodLine + grumpLine + sleepToneLine + spendLine + moodMemoryLine + moodBoardLine + relationLine + askLine + statusLine + usageLine + stickerContextLine
       + memoryLine + participationLine + recallLine + longRecallLine
-      + followUpLine + anniversaryLine + memorySelfCheckLine + coldShoulderLine + replyLine;
+      + followUpLine + anniversaryLine + memorySelfCheckLine + coldShoulderLine + replyLine + linkLine;
     // [省token] 瘦身模式：补答回合 / 群聊正热时只留「人设 + 规则 + 台账 + 状态 + 收尾」，
     // 砍掉摘要/回放/动漫库/表情清单/参与感/关系/习惯等段落（实测每轮约 4900 → 2200 字）。
     //
@@ -417,7 +422,7 @@ export function createWakePrompt(S) {
           styleLine,
           participationLine, recallLine, longRecallLine, replyLine,
           followUpLine, anniversaryLine, memorySelfCheckLine, coldShoulderLine,
-          sleepToneLine, spendLine,
+          sleepToneLine, spendLine, linkLine,
         };
         const rows = Object.entries(parts)
           .filter(([, v]) => typeof v === 'string' && v.length > 0)

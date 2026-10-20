@@ -98,6 +98,8 @@ export function createSocialState(S) {
         lastBiliStrollDay: '',
         // [搜索沉淀] 已 ingest 进记忆库的最新卡片时间戳（增量游标，跨重启保留）。
         lastSearchCardAt: 0,
+        // [记忆巩固] 最近一次跑 consolidateFacts 的日期（YYYY-MM-DD，一天一次）。
+        lastMemoryConsolidateDay: '',
         // [养鱼·追更] 关注的 UP 主最新投稿水位 { [mid]: { name, lastBvid, lastTitle, lastPubdate, seeded } }。
         biliFollowState: {},
         // [养鱼·追更] 当天检查判重 { day, checks, done }：一天最多查 checksPerDay 次、安利一轮。
@@ -236,6 +238,7 @@ export function createSocialState(S) {
             lastMemorySelfCheckAt: Number(val.lastMemorySelfCheckAt) || 0,
             lastBiliStrollDay: String(val.lastBiliStrollDay || ''),
             lastSearchCardAt: Number(val.lastSearchCardAt) || 0,
+            lastMemoryConsolidateDay: String(val.lastMemoryConsolidateDay || ''),
             // [养鱼·追更] 水位归一化：只留结构完整的条目，键名挡掉原型链污染。
             biliFollowState: (() => {
               const raw = (val.biliFollowState && typeof val.biliFollowState === 'object') ? val.biliFollowState : {};
@@ -388,6 +391,7 @@ export function createSocialState(S) {
           lastMemorySelfCheckAt: Number(st.lastMemorySelfCheckAt) || 0,
           lastBiliStrollDay: String(st.lastBiliStrollDay || ''),
           lastSearchCardAt: Number(st.lastSearchCardAt) || 0,
+          lastMemoryConsolidateDay: String(st.lastMemoryConsolidateDay || ''),
           // [养鱼·追更] 水位跨重启保留（lastBvid 判新就靠它）。
           biliFollowState: st.biliFollowState && typeof st.biliFollowState === 'object' ? st.biliFollowState : {},
           biliFollowCheck: st.biliFollowCheck && typeof st.biliFollowCheck === 'object' ? st.biliFollowCheck : null,

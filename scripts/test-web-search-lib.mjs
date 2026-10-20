@@ -5,6 +5,7 @@ import {
   parseBingHtml, parseDuckHtml, parseBaiduHtml,
   SearchCache, searchWeb as searchWebReal, renderSearchResult,
   normalizeUrl, titleKey, mergeResults, ttlForQuery, smartTruncate,
+  extractDate, annotateDates,
   setSourceHealth, sourceCooldownLeft, resetSourceCooldowns,
   SOURCE_TIMEOUT_MS, CACHE_MAX_ENTRIES, FAILURE_MEMO_MS,
   TTL_FAST_MS, TTL_SLOW_MS, TTL_DEFAULT_MS
@@ -505,6 +506,33 @@ eq('缓存上限 200', CACHE_MAX_ENTRIES, 200);
   setSourceHealth(null);
   resetSourceCooldowns();
   eq('解绑后恢复干净', sourceCooldownLeft('sogou'), 0);
+}
+
+// ── [2026-10-20] 结果时效标注 ──────────────────────────────────────────
+{
+  const now = Date.UTC(2026, 9, 20, 12, 0, 0);
+  eq('绝对日期', extractDate('发布于 2023-05-12 的公告', now)?.label, '2023-05-12');
+  eq('中文年月', extractDate('2023年5月更新', now)?.label, '2023-05');
+  eq('斜杠日期', extractDate('2024/7/1 起施行', now)?.label, '2024-07-01');
+  eq('相对时间', extractDate('3天前更新', now)?.label, '3天前');
+  ok('相对时间能算出时间戳', Math.abs((now - extractDate('2小时前', now).ts) - 7200000) < 1000);
+  eq('价格区间不会被当日期', extractDate('价格 2000-3000元', now), null);
+  eq('版本号不会被当日期', extractDate('原神5.0版本', now), null);
+  eq('未来日期不认', extractDate('2099-01-01', now), null);
+  eq('没日期返回 null', extractDate('今天天气不错', now), null);
+
+  const annotated = annotateDates([
+    { title: '有日期的', snippet: '2024-03-05 发布' },
+    { title: '没日期的', snippet: '内容' }
+  ], now);
+  eq('抽到的补上 date', annotated[0].date, '2024-03-05');
+  eq('没抽到的原样', annotated[1].date, undefined);
+
+  const rendered = renderSearchResult({ query: 'q', source: 's', results: [{ title: 'T', snippet: 'S', date: '2023-05-12' }] }, { max: 3 });
+  ok('结果里带日期', rendered.includes('（2023-05-12）'));
+  const stale = renderSearchResult({ query: 'q', source: 's', results: [{ title: 'T' }], staleHint: '这批结果都比较旧' });
+  ok('旧结果警告会显示', stale.includes('这批结果都比较旧'));
+  ok('没有警告时不多一个字', !renderSearchResult({ query: 'q', source: 's', results: [{ title: 'T' }] }).includes('⚠'));
 }
 
 console.log(`联网搜索（纯逻辑）：${pass} 通过 / ${fail} 失败`);

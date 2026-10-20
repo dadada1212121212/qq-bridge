@@ -24,6 +24,7 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { safeFetch, safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { extractLinks, htmlToText, extractTitle, formatLinkDigest } from './link-digest.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
@@ -9101,6 +9102,69 @@ async function main() {
     }
   }
 
+  // ── [链接顺手读 2026-10-20] ────────────────────────────────────────────
+  // 群里有人甩个链接，她原来得「自己想得起来」去调 web_fetch —— 多数时候就是装作没看见，
+  // 或者回一句「你发的啥」。现在消息一进来就在后台抓一份正文摘要，等她被叫醒时
+  // 直接把内容摆到眼前，她能顺着聊下去。
+  // 成本控制：只有消息里真的带链接才发请求；同一个 URL 30 分钟内只抓一次；
+  // 唤醒时最多等 2.5 秒（还没抓好就先不塞，绝不为了一个网页把回复拖慢）。
+  const LINK_DIGEST_TTL_V2 = 30 * 60 * 1000;
+  const LINK_RECENT_TTL_V2 = 10 * 60 * 1000;
+  const linkPendingV2 = new Map(); // url -> Promise
+  const linkReadyV2 = new Map();   // url -> { at, title, text, error }
+  const linkRecentV2 = new Map();  // key -> { url, at }
+
+  async function fetchLinkDigestV2(url) {
+    try {
+      const r = await safeFetch(url, 30000, { timeoutMs: 6000 });
+      const html = String(r?.body || '');
+      const title = extractTitle(html);
+      const text = htmlToText(html);
+      // 太短的正文多半是登录墙/JS 空壳/风控页，硬塞给她只会让她瞎编。
+      if (text.length < 80) return { error: '正文太短（可能需要登录或纯 JS 渲染）' };
+      return { title, text: text.slice(0, 900) };
+    } catch (error) {
+      return { error: String(error?.message ?? error).slice(0, 80) };
+    }
+  }
+
+  function noteLinksV2(key, text) {
+    const urls = extractLinks(text);
+    if (!urls.length) return;
+    const url = urls[0];
+    const now = Date.now();
+    linkRecentV2.set(key, { url, at: now });
+    if (linkRecentV2.size > 200) linkRecentV2.delete(linkRecentV2.keys().next().value);
+    const ready = linkReadyV2.get(url);
+    if (ready && now - ready.at < LINK_DIGEST_TTL_V2) return;
+    if (linkPendingV2.has(url)) return;
+    const p = fetchLinkDigestV2(url)
+      .then((d) => { if (d) linkReadyV2.set(url, { at: Date.now(), ...d }); })
+      .catch(() => { /* 抓不到就当没这回事 */ })
+      .finally(() => linkPendingV2.delete(url));
+    linkPendingV2.set(url, p);
+    if (linkReadyV2.size > 60) linkReadyV2.delete(linkReadyV2.keys().next().value);
+  }
+
+  /** 唤醒前等一小会儿：链接刚到、摘要还在路上时，别让她「没看见」就开口。 */
+  async function waitLinkDigestV2(key, maxMs = 2500) {
+    const rec = linkRecentV2.get(key);
+    if (!rec || Date.now() - rec.at > LINK_RECENT_TTL_V2) return;
+    if (linkReadyV2.has(rec.url)) return;
+    const p = linkPendingV2.get(rec.url);
+    if (!p) return;
+    await Promise.race([p, new Promise((resolve) => setTimeout(resolve, maxMs))]);
+  }
+
+  /** 唤醒提示词里的链接段（同步读缓存，抓不到就返回空串）。 */
+  function linkDigestLineV2(key) {
+    const rec = linkRecentV2.get(key);
+    if (!rec || Date.now() - rec.at > LINK_RECENT_TTL_V2) return '';
+    const d = linkReadyV2.get(rec.url);
+    if (!d || d.error) return '';
+    return formatLinkDigest({ title: d.title, text: d.text, url: rec.url });
+  }
+
   function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
     noteActiveChatKey(key);
     const st = getSocialV2State(key);
@@ -9155,6 +9219,8 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // [链接顺手读] 消息里带 URL 就后台抓一份摘要（不 await，绝不拖慢入库）。
+    try { noteLinksV2(key, msg.plain || msg.text || ''); } catch { /* 抓不到就算了 */ }
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -9655,6 +9721,7 @@ async function main() {
     groupRecapTargetDayV2,
     grumpSignalsV2,
     historyRecallV2,
+    linkDigestLineV2,
     sleepToneLineV2,
     spendLineV2,
     log,
@@ -10136,6 +10203,8 @@ async function main() {
     saveSocialV2State();
     // [省token] 瘦提示词判定一次、两处复用（这里 build 一次用于日志，deliverPromptNow 会重建）。
     const wakeSlim = shouldSlimWakeV2(key, st, reason);
+    // [链接顺手读] 这条消息带链接且摘要还在路上时，最多等 2.5 秒再构建提示词。
+    try { await waitLinkDigestV2(key, 2500); } catch { /* 等不到就算了 */ }
     const promptText = buildWakePromptV2(key, reason, { slim: wakeSlim });
     log(`[reserved2] 唤醒 ${key}（${reason}）${wakeSlim ? ' [瘦提示词]' : ''}`);
     // 先让对面看到「正在输入」，再真正开始跑回合 —— 这一回合要几十秒，静默几十秒再蹦出一整段
@@ -10781,7 +10850,9 @@ async function main() {
     const now = Date.now();
     if (now - searchCardIngestAtV2 < SEARCH_CARD_INGEST_EVERY_MS) return;
     searchCardIngestAtV2 = now;
-    const st = getSocialV2State();
+    // ⚠️ getSocialV2State() 必须带会话 key（无参会抛错，而 tick 外面套了 try/catch，
+    // 结果就是"每 60 秒静默失败一次"）。游标挂在主人私聊那条会话上，跟巡园同一个做法。
+    const st = socialV2.conversations.get('private:' + String(cfg.ownerQQ ?? ''));
     if (!st) return;
     const since = Number(st.lastSearchCardAt) || 0;
     const mdb = memoryDb();
@@ -10818,6 +10889,39 @@ async function main() {
     }
   }
 
+  // ── [记忆巩固 2026-10-20] ──────────────────────────────────────────────
+  // consolidateFacts 早就写好了但没人定时跑：facts 越堆越多，既占提示词预算，
+  // 也会出现「同一件事记了五遍、措辞各不相同」。每天凌晨跑一次，做三件事：
+  //   ① 近似重复合并（规范化后互相包含 → 留新的）
+  //   ② 过期清理（tags 带 auto、从没被命中、超 maxAgeDays 的自动提炼项）
+  //   ③ 每个主体限量（超出的旧条目裁掉）
+  // 只动 tags 含 auto 的自动项，她真正记下的事（对话里学到的）不会被动。
+  function memoryConsolidateTickV2() {
+    const c = cfg.socialV2?.memoryConsolidate;
+    if (c?.enabled === false) return;
+    const d = new Date();
+    const hour = Number.isFinite(Number(c?.hour)) ? Number(c.hour) : 4;
+    if (d.getHours() !== hour) return;
+    const day = localDayString(0);
+    const st = socialV2.conversations.get('private:' + String(cfg.ownerQQ ?? ''));
+    if (!st || st.lastMemoryConsolidateDay === day) return;
+    const mdb = memoryDb();
+    if (!mdb) return;
+    let r = { merged: 0, expired: 0, trimmed: 0 };
+    try {
+      r = mdb.consolidateFacts({
+        maxAgeDays: Number(c?.maxAgeDays) || 120,
+        maxPerSubject: Number(c?.maxPerSubject) || 10
+      }) || r;
+    } catch (error) {
+      log(`[记忆巩固] 执行失败：${error?.message ?? error}`);
+      return;
+    }
+    st.lastMemoryConsolidateDay = day;
+    try { saveSocialV2State(); } catch { /* */ }
+    log(`[记忆巩固] ${day} 完成：合并 ${r.merged} / 过期 ${r.expired} / 裁剪 ${r.trimmed}`);
+  }
+
   const PROMISE_INTERVAL_MS_V2 = 60000;
   function promiseDueTickV2() {
     if (cfg.socialV2?.enabled === false || socialV2.paused) return;
@@ -10831,6 +10935,8 @@ async function main() {
     try { birthdayWakeTickV2(); } catch (error) { log(`[生日] tick 异常：${error?.message ?? error}`); }
     // [搜索沉淀] 她联网查过的东西进记忆库（10 分钟一次，跨进程读文件）。
     try { searchCardIngestTickV2(); } catch (error) { log(`[搜索沉淀] tick 异常：${error?.message ?? error}`); }
+    // [记忆巩固] 凌晨把碎片合并/去重/限量，一天一次。
+    try { memoryConsolidateTickV2(); } catch (error) { log(`[记忆巩固] tick 异常：${error?.message ?? error}`); }
     for (const key of socialV2.conversations.keys()) {
       if (!isSessionAllowedInCurrentMode(key)) continue;
       const st = socialV2.conversations.get(key);
