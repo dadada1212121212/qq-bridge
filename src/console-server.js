@@ -2036,6 +2036,63 @@ export function createConsoleServer(S) {
           sendJson({ ok: true, account, quota: { ...quota, caps: CAPS }, lastStroll });
           return;
         }
+        if (req.method === 'GET' && url.pathname === '/api/search/status') {
+          // [搜索面板 2026-10-20] 联网搜索的运行状况：今天搜了几次、命中几次缓存、
+          // 平均耗时、各源健康度、落盘缓存/卡片台账规模。只读本地文件，不联网。
+          const readJson = (name, fallback) => {
+            try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'state', name), 'utf8')); } catch { return fallback; }
+          };
+          const todayKey = new Date().toISOString().slice(0, 10);
+          const statsFile = readJson('search-stats.json', { days: {} });
+          const raw = statsFile?.days?.[todayKey] || {};
+          const num = (v) => Number(v) || 0;
+          const today = {
+            searches: num(raw.searches), memHits: num(raw.memHits), diskHits: num(raw.diskHits),
+            net: num(raw.net), empty: num(raw.empty),
+            fetches: num(raw.fetches), fetchFails: num(raw.fetchFails),
+            avgMs: num(raw.n) ? Math.round(num(raw.ms) / num(raw.n)) : 0
+          };
+          const days = Object.keys(statsFile?.days || {}).sort().slice(-7).map((d) => {
+            const v = statsFile.days[d] || {};
+            return {
+              day: d,
+              searches: num(v.searches),
+              cacheHits: num(v.memHits) + num(v.diskHits),
+              avgMs: num(v.n) ? Math.round(num(v.ms) / num(v.n)) : 0
+            };
+          });
+          const cacheFile = readJson('search-cache.json', { entries: {} });
+          const srcFile = readJson('search-sources.json', { engines: {}, probe: { at: 0, ok: {} } });
+          const nowTs = Date.now();
+          const sources = Object.entries(srcFile?.engines || {}).map(([name, s]) => {
+            const ok = num(s?.ok); const fail = num(s?.fail);
+            return {
+              name, ok, fail,
+              rate: ok + fail ? Math.round((ok / (ok + fail)) * 100) : 0,
+              cooldownLeftSec: Math.max(0, Math.round(((Number(s?.cooldownUntil) || 0) - nowTs) / 1000))
+            };
+          }).sort((a, b) => b.ok - a.ok);
+          let cardCount = 0; let lastCard = null;
+          try {
+            const lines = fs.readFileSync(path.join(ROOT, 'state', 'search-cards.jsonl'), 'utf8').split('\n').filter(Boolean);
+            cardCount = lines.length;
+            try { lastCard = JSON.parse(lines[lines.length - 1]); } catch { lastCard = null; }
+          } catch { /* 还没搜过 */ }
+          sendJson({
+            ok: true,
+            today,
+            days,
+            cache: { entries: Object.keys(cacheFile?.entries || {}).length, at: Number(cacheFile?.at) || 0 },
+            cards: {
+              count: cardCount,
+              lastQuery: String(lastCard?.query || ''),
+              lastAt: Number(lastCard?.at) || 0
+            },
+            sources,
+            probe: { at: Number(srcFile?.probe?.at) || 0, ok: srcFile?.probe?.ok || {} }
+          });
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/cfgmods/history') {
           const h = cfgmodReadHistory(path.join(ROOT, 'state', 'cfgmods-history.json'));
           sendJson({ ok: true, history: h.slice(-40).reverse() });

@@ -10768,6 +10768,56 @@ async function main() {
   // [承诺/待办] 到期待办看门狗：每分钟扫一遍所有会话，有到期的就唤醒一次，
   // 让她自己看到【答应过的事】并主动提。和 diary 一样"过点也补"——桥重启后漏掉的那次也能补上。
   // 去重靠 st.promises[*].remindedAt：同一条待办在到期后只主动提醒一次，不会每分钟轰炸。
+  // ── [搜索沉淀 2026-10-20] ──────────────────────────────────────────────
+  // MCP 进程每搜一次就往 state/search-cards.jsonl 追加一张卡（词 + 要点 + 前几条结果）。
+  // 这里每 10 分钟把新卡片灌进记忆库的 facts：这样"她查过什么"能进唤醒提示的
+  // 【你记着的事】，下次聊到同一个梗不用再搜一遍（MCP 自己也会先查卡片，双保险）。
+  // 跨进程只走文件，不碰 sqlite —— 桥接是唯一写库方，避免并发写坏。
+  const SEARCH_CARD_FILE_V2 = path.join(ROOT, 'state', 'search-cards.jsonl');
+  let searchCardIngestAtV2 = 0;
+  const SEARCH_CARD_INGEST_EVERY_MS = 10 * 60 * 1000;
+  const SEARCH_CARD_PER_RUN_V2 = 4;
+  function searchCardIngestTickV2() {
+    const now = Date.now();
+    if (now - searchCardIngestAtV2 < SEARCH_CARD_INGEST_EVERY_MS) return;
+    searchCardIngestAtV2 = now;
+    const st = getSocialV2State();
+    if (!st) return;
+    const since = Number(st.lastSearchCardAt) || 0;
+    const mdb = memoryDb();
+    if (!mdb) return;
+    let lines = [];
+    try { lines = fs.readFileSync(SEARCH_CARD_FILE_V2, 'utf8').split('\n').filter(Boolean); } catch { return; }
+    let newest = since;
+    let added = 0;
+    for (const line of lines.slice(-120)) {
+      let c = null;
+      try { c = JSON.parse(line); } catch { continue; }
+      const at = Number(c?.at) || 0;
+      if (!at || at <= since) continue;
+      if (at > newest) newest = at;
+      if (added >= SEARCH_CARD_PER_RUN_V2) continue;
+      const q = String(c.query || '').trim().slice(0, 40);
+      const sum = String(c.summary || '').replace(/\s+/g, ' ').trim().slice(0, 70);
+      if (!q || !sum) continue;
+      try {
+        mdb.recordFact({
+          scope: 'global',
+          subject: `搜索:${q}`,
+          text: `查过「${q}」：${sum}`,
+          tags: 'search',
+          source: 'search',
+          onlyIfNew: true
+        });
+        added += 1;
+      } catch { /* 记忆写失败不影响主链路 */ }
+    }
+    if (newest > since) {
+      st.lastSearchCardAt = newest;
+      try { saveSocialV2State(); } catch { /* */ }
+    }
+  }
+
   const PROMISE_INTERVAL_MS_V2 = 60000;
   function promiseDueTickV2() {
     if (cfg.socialV2?.enabled === false || socialV2.paused) return;
@@ -10779,6 +10829,8 @@ async function main() {
     try { biliReplyTickV2(); } catch (error) { log(`[评论区] tick 异常：${error?.message ?? error}`); }
     // [群友生日] 印象档案里记过生日的人，今天生日的主动祝寿。
     try { birthdayWakeTickV2(); } catch (error) { log(`[生日] tick 异常：${error?.message ?? error}`); }
+    // [搜索沉淀] 她联网查过的东西进记忆库（10 分钟一次，跨进程读文件）。
+    try { searchCardIngestTickV2(); } catch (error) { log(`[搜索沉淀] tick 异常：${error?.message ?? error}`); }
     for (const key of socialV2.conversations.keys()) {
       if (!isSessionAllowedInCurrentMode(key)) continue;
       const st = socialV2.conversations.get(key);

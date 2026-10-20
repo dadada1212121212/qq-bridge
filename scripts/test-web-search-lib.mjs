@@ -4,7 +4,10 @@ import {
   sanitizeQuery, decodeHtml, unwrapBingUrl, splitResultBlocks,
   parseBingHtml, parseDuckHtml, parseBaiduHtml,
   SearchCache, searchWeb as searchWebReal, renderSearchResult,
-  SOURCE_TIMEOUT_MS, CACHE_MAX_ENTRIES, FAILURE_MEMO_MS
+  normalizeUrl, titleKey, mergeResults, ttlForQuery, smartTruncate,
+  setSourceHealth, sourceCooldownLeft, resetSourceCooldowns,
+  SOURCE_TIMEOUT_MS, CACHE_MAX_ENTRIES, FAILURE_MEMO_MS,
+  TTL_FAST_MS, TTL_SLOW_MS, TTL_DEFAULT_MS
 } from '../src/web-search-lib.js';
 
 // 假引擎的标题（'F'/'t'）跟查询词毫无关系，相关度过滤会把它们全丢掉；
@@ -444,6 +447,64 @@ eq('缓存上限 200', CACHE_MAX_ENTRIES, 200);
 }
   ok('有风控冷却时长', SOURCE_COOLDOWN_MS >= 10000);
   ok('合并宽限期不超过单个源超时', MERGE_GRACE_MS > 0 && MERGE_GRACE_MS <= SOURCE_TIMEOUT_MS);
+}
+
+// ── [2026-10-20] 去重 / TTL / 截断 / 源健康度 ──────────────────────────
+{
+  // 规范化地址：去掉跟踪参数、锚点、www、末尾斜杠
+  eq('去 utm/锚点/末尾斜杠', normalizeUrl('https://www.bilibili.com/video/BV1xx/?utm_source=a&spm_id_from=b#t=1'), 'bilibili.com/video/BV1xx');
+  eq('http 与 https 视为同一条', normalizeUrl('http://example.com/a/'), normalizeUrl('https://example.com/a'));
+  eq('保留有意义的查询参数', normalizeUrl('https://a.com/s?q=%E5%8E%9F%E7%A5%9E'), 'a.com/s?q=%E5%8E%9F%E7%A5%9E');
+  eq('非法地址不炸', normalizeUrl('不是地址'), '不是地址');
+
+  // 标题指纹：忽略空格标点
+  eq('标题指纹忽略标点空格', titleKey('【原神】5.0 卡池！'), titleKey('原神 5.0 卡池'));
+
+  // 合并去重：三个源给同一条只留一条
+  const merged = mergeResults(
+    [{ url: 'https://www.a.com/x/?utm_source=1', title: '同一个页面' }],
+    [
+      { url: 'http://a.com/x', title: '同一个页面' },
+      { url: 'https://b.com/y', title: '另一个页面' },
+      { url: 'https://c.com/z', title: '完全不同的标题内容' }
+    ]
+  );
+  eq('规范化地址 + 标题指纹双重去重', merged.length, 3);
+  ok('保留先出现的那个', merged[0].url.includes('utm_source'));
+  eq('空输入安全', mergeResults([], []), []);
+
+  // 缓存 TTL 分层
+  eq('时效性查询用短 TTL', ttlForQuery('今天天气怎么样'), TTL_FAST_MS);
+  eq('价格类用短 TTL', ttlForQuery('显卡现在多少钱'), TTL_FAST_MS);
+  eq('梗/常识用长 TTL', ttlForQuery('这个梗是什么意思'), TTL_SLOW_MS);
+  eq('其它用默认 TTL', ttlForQuery('量子力学'), TTL_DEFAULT_MS);
+  ok('短 TTL 明显短于长 TTL', TTL_FAST_MS < TTL_SLOW_MS && TTL_FAST_MS <= TTL_DEFAULT_MS);
+
+  // 智能截断：短文不动
+  const shortText = '很短的一段正文。';
+  const st = smartTruncate(shortText, 8000);
+  eq('短文不截断', st.truncated, false);
+  eq('短文原样返回', st.text, shortText);
+
+  // 长文：保头保尾 + 给续读 offset
+  const longText = Array.from({ length: 500 }, (_, i) => `第${i}段：这是一段用来测试截断的内容，长度大约二十来个字。`).join('\n');
+  const lt = smartTruncate(longText, 2000);
+  eq('长文被截断', lt.truncated, true);
+  ok('保留开头', lt.text.startsWith('第0段'));
+  ok('保留了尾部内容', lt.text.includes('第499段'));
+  ok('中间有省略标记', lt.text.includes('中间省略'));
+  ok('给了续读 offset', lt.nextOffset > 1000 && lt.nextOffset < longText.length);
+  ok('切点在句子边界（不会切半个字）', /[。\n]$/.test(lt.text.slice(0, lt.text.indexOf('\n…（中间省略'))));
+  const resumed = smartTruncate(longText.slice(lt.nextOffset), 2000, lt.nextOffset);
+  ok('从 offset 续读能拿到后面的内容', resumed.text.trimStart().startsWith('第') && resumed.text.includes('段'));
+
+  // 源健康度播种：跨重启的冷却要进进程内冷却表
+  resetSourceCooldowns();
+  setSourceHealth({ cooldownMap: () => new Map([['sogou', Date.now() + 5000]]) });
+  ok('落盘冷却能播种进进程', sourceCooldownLeft('sogou') > 0);
+  setSourceHealth(null);
+  resetSourceCooldowns();
+  eq('解绑后恢复干净', sourceCooldownLeft('sogou'), 0);
 }
 
 console.log(`联网搜索（纯逻辑）：${pass} 通过 / ${fail} 失败`);

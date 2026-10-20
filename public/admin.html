@@ -224,6 +224,7 @@ pre.output{margin:0;padding:12px 14px;border-radius:12px;background:var(--surfac
     <button class="nav-item" data-view="cfgfiles"><span class="ico">⇪</span>配置文件</button>
     <button class="nav-item" data-view="costs"><span class="ico">¥</span>成本账本</button>
     <button class="nav-item" data-view="bili"><span class="ico">🐟</span>B 站养鱼</button>
+    <button class="nav-item" data-view="search"><span class="ico">🔍</span>联网搜索</button>
     <button class="nav-item" data-view="settings"><span class="ico">⚙</span>白名单与安全</button>
     <button class="nav-item" data-view="runtime"><span class="ico">⚡</span>省 token 与速度</button>
     <button class="nav-item" data-view="ops"><span class="ico">✦</span>运维</button>
@@ -521,7 +522,7 @@ function navCap() {
 }
 function loadView(view) {
   state.view = view;
-  var titles = { overview: '总览', sessions: '会话与唤醒', usage: '用量与花费', kb: '知识库', memes: '表情包仓库', memory: '记忆', persona: '人格与提示词', features: '功能开关', plugins: '插件', cfgfiles: '配置文件投递', costs: '成本账本', bili: 'B 站养鱼', settings: '白名单与安全', runtime: '省 token 与速度', ops: '运维' };
+  var titles = { overview: '总览', sessions: '会话与唤醒', usage: '用量与花费', kb: '知识库', memes: '表情包仓库', memory: '记忆', persona: '人格与提示词', features: '功能开关', plugins: '插件', cfgfiles: '配置文件投递', costs: '成本账本', bili: 'B 站养鱼', search: '联网搜索', settings: '白名单与安全', runtime: '省 token 与速度', ops: '运维' };
   $('page-title').textContent = titles[view] || view;
   document.querySelectorAll('.nav-item').forEach(function (b) { b.classList.toggle('active', b.dataset.view === view); });
   var box = $('view');
@@ -539,6 +540,7 @@ function loadView(view) {
   else if (view === 'cfgfiles') job = renderCfgfiles();
   else if (view === 'costs') job = renderCosts();
   else if (view === 'bili') job = renderBili();
+  else if (view === 'search') job = renderSearch();
   else if (view === 'settings') job = renderSettings();
   else if (view === 'runtime') job = renderRuntime();
   else if (view === 'ops') job = renderOps();
@@ -614,6 +616,53 @@ function renderBili() {
     }).catch(function (err) { $('bi-body').innerHTML = '<p class="desc">加载失败：' + esc(err.message) + '</p>'; });
   }
   $('bi-refresh').addEventListener('click', load);
+  load();
+}
+
+// ── 联网搜索 ────────────────────────────────────────────────────────────
+function renderSearch() {
+  var box = $('view');
+  box.innerHTML = '<div class="card"><h3>联网搜索 · 运行状况</h3>'
+    + '<p class="desc">她查东西走的是自建搜索服务（多源并行 + 两级缓存），不走宿主接口，不按次计费。这里看今天搜了多少、缓存命中多少、各源还活着没有。</p>'
+    + '<div style="margin:8px 0"><button id="se-refresh" style="padding:6px 14px;border:1px solid #d8dee4;border-radius:8px;background:#fff;cursor:pointer">刷新</button></div>'
+    + '<div id="se-body"></div></div>';
+  function pct(part, all) { return all ? Math.round(100 * part / all) : 0; }
+  function load() {
+    $('se-body').innerHTML = '<p class="desc">读取中…</p>';
+    api('/api/search/status').then(function (r) {
+      if (!r.ok) { $('se-body').innerHTML = '<p class="desc">读取失败：' + esc(r.error || '未知') + '</p>'; return; }
+      var t = r.today || {}, c = r.cache || {}, cd = r.cards || {}, pr = r.probe || {};
+      var hitRate = pct((t.memHits || 0) + (t.diskHits || 0), t.searches || 0);
+      var rows = (r.sources || []).map(function (s) {
+        var state = s.cooldownLeftSec > 0
+          ? '<span class="badge warn">冷却 ' + s.cooldownLeftSec + 's</span>'
+          : (s.rate >= 50 ? '<span class="badge ok">正常</span>' : '<span class="badge warn">成功率低</span>');
+        return '<tr><td>' + esc(s.name) + '</td><td>' + s.ok + ' / ' + s.fail + '</td><td>' + s.rate + '%</td><td>' + state + '</td></tr>';
+      }).join('');
+      var days = (r.days || []).map(function (d) {
+        return '<tr><td>' + esc(d.day) + '</td><td>' + d.searches + '</td><td>' + d.cacheHits + '</td><td>' + d.avgMs + ' ms</td></tr>';
+      }).join('');
+      var probeKeys = Object.keys(pr.ok || {});
+      var probeText = pr.at
+        ? probeKeys.map(function (k) { return esc(k) + (pr.ok[k] ? ' 通' : ' 不通'); }).join('　')
+        : '还没探测过';
+      $('se-body').innerHTML = '<div class="kv">'
+        + '<div class="k">今日搜索</div><div class="v">' + (t.searches || 0) + ' 次（真联网 ' + (t.net || 0) + '，空手 ' + (t.empty || 0) + '）</div>'
+        + '<div class="k">缓存命中</div><div class="v">' + ((t.memHits || 0) + (t.diskHits || 0)) + ' 次（' + hitRate + '%）　内存 ' + (t.memHits || 0) + ' / 落盘 ' + (t.diskHits || 0) + '</div>'
+        + '<div class="k">平均耗时</div><div class="v">' + (t.avgMs || 0) + ' ms</div>'
+        + '<div class="k">抓网页</div><div class="v">' + (t.fetches || 0) + ' 次（失败 ' + (t.fetchFails || 0) + '）</div>'
+        + '<div class="k">落盘缓存</div><div class="v">' + (c.entries || 0) + ' 条</div>'
+        + '<div class="k">查询卡片</div><div class="v">' + (cd.count || 0) + ' 张' + (cd.lastQuery ? '（最近：' + esc(cd.lastQuery) + '）' : '') + '</div>'
+        + '<div class="k">出口探测</div><div class="v">' + probeText + '</div>'
+        + '</div>'
+        + '<h3 style="margin-top:14px">各源健康度</h3>'
+        + (rows ? '<table><thead><tr><th>源</th><th>成功 / 失败</th><th>成功率</th><th>状态</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<p class="desc">还没有调用记录。</p>')
+        + '<h3 style="margin-top:14px">最近 7 天</h3>'
+        + (days ? '<table><thead><tr><th>日期</th><th>搜索</th><th>缓存命中</th><th>平均耗时</th></tr></thead><tbody>' + days + '</tbody></table>' : '<p class="desc">暂无数据。</p>')
+        + '<p class="desc">缓存分层：新闻/价格这类 30 分钟过期，梗/常识 24 小时。长期失败的源会记在盘上，重启后继续跳过，不再白等超时。</p>';
+    }).catch(function (err) { $('se-body').innerHTML = '<p class="desc">加载失败：' + esc(err.message) + '</p>'; });
+  }
+  $('se-refresh').addEventListener('click', load);
   load();
 }
 

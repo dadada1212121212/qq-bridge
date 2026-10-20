@@ -10,49 +10,235 @@
 //   - 手动跟随重定向，每一跳都重新校验；
 //   - 响应体按字节流限量读取，避免超大响应拖垮进程。
 //
-// 响应提速（2026-10-15 重写 web_search 的数据层）：
-//   原实现只抓 Bing 一个源，实测 Bing 在两种页面形态间随机切换（约 50% 的请求
-//   一条结果都没有），且解析依赖精确字符串、Bing 一改 class 就全废。
-//   现在改为 src/web-search-lib.js 的 **多源并行竞速 + 每源短超时 + 结果缓存**：
-//   Bing / DuckDuckGo Lite / 百度同时打，谁先给出有效结果就用谁；
-//   每源 3.5s 超时（不再等 20s）；同一个词第二次搜是零网络延迟。
+// 2026-10-20 架构升级（A~G）：
+//   A 结果缓存落盘：内存 LRU + state/search-cache.json，进程重启不再清零；
+//     每条按查询类型给 TTL（新闻 30 分钟 / 梗 24 小时 / 其它 6 小时）。
+//   B 查询卡片台账：每次搜索压成一张卡（state/search-cards.jsonl），
+//     下次问近似问题先按 token 重叠召回（零网络）；桥接进程再把卡片 ingest 进记忆库。
+//   C web_fetch 支持 offset 续读 + 智能截断（保头保尾、切点落在句子边界）。
+//   D 源健康度落盘：长期失败的源跨重启继续跳过，不再每次白等 3.5s。
+//   E 出口探测：DDG/百度探通就自动并入源池，不用手改代码。
+//   F 合并去重按规范化 URL + 标题指纹（三个源给同一条只留一条）。
+//   G 当日统计落盘：搜了几次、命中几次缓存、平均耗时，控制台可看。
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { safeFetch } from './safe-fetch.js';
-import { searchWeb, renderSearchResult, SearchCache, SOURCE_TIMEOUT_MS } from './web-search-lib.js';
+import {
+  searchWeb, renderSearchResult, SearchCache, SOURCE_TIMEOUT_MS,
+  SEARCH_ENGINES, SEARCH_ENGINES_EXTRA, PROBE_ENGINE_DEFS,
+  setSourceHealth, ttlForQuery, queryTokens, sanitizeQuery, smartTruncate,
+  TTL_FAST_MS
+} from './web-search-lib.js';
+import { createDiskCache, createSourceHealth, createStats, createCardLog } from './search-store.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-// 进程级搜索缓存：同一个词在她反复问"这是啥梗"时几乎都是命中，省下整趟网络往返。
-const searchCache = new SearchCache();
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const STATE_DIR = path.join(REPO_ROOT, 'state');
+const CACHE_FILE = path.join(STATE_DIR, 'search-cache.json');
+const HEALTH_FILE = path.join(STATE_DIR, 'search-sources.json');
+const STATS_FILE = path.join(STATE_DIR, 'search-stats.json');
+const CARD_FILE = path.join(STATE_DIR, 'search-cards.jsonl');
 
-/** 把 safeFetch 包成 web-search-lib 需要的 `fetchText(url, timeoutMs)`。 */
-async function fetchText(url, timeoutMs) {
-  const res = await safeFetch(url, 512000, { timeoutMs: timeoutMs || SOURCE_TIMEOUT_MS });
+/** stdio 传输下 stdout 是协议通道，日志一律走 stderr。 */
+const log = (...args) => { try { console.error('[web-search]', ...args); } catch { /* */ } };
+
+// ── 存储层 ────────────────────────────────────────────────────────────────
+const memCache = new SearchCache();
+const diskCache = createDiskCache({ file: CACHE_FILE, maxEntries: 300, log });
+const health = createSourceHealth({ file: HEALTH_FILE, log });
+setSourceHealth(health);
+const stats = createStats({ file: STATS_FILE, log });
+const cards = createCardLog({ file: CARD_FILE, log });
+
+/**
+ * 退出前把去抖中的写入落盘。
+ * ⚠️ 实测踩到：MCP 是短命进程，客户端一断就被杀；800ms 去抖还没到点，
+ * "最后一次搜索"的统计/缓存/健康度就整批丢了（第一次跑只留下 searches=1，net 和缓存全没写）。
+ */
+const flushers = [diskCache, health, stats];
+const flushAll = () => { for (const f of flushers) { try { f.flush(); } catch { /* */ } } };
+process.on('exit', flushAll);
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  try { process.on(sig, () => { flushAll(); process.exit(0); }); } catch { /* 平台不支持就算了 */ }
+}
+
+/**
+ * 两级缓存：内存（10 分钟）→ 磁盘（按查询类型 30 分钟~24 小时）。
+ * `lastLayer` 给统计用：区分"命中的是内存还是落盘缓存"。
+ */
+const cache = {
+  lastLayer: '',
+  get(key) {
+    const mem = memCache.get(key);
+    if (mem) { this.lastLayer = 'mem'; return mem; }
+    const disk = diskCache.get(key);
+    if (disk) { this.lastLayer = 'disk'; memCache.set(key, disk); return disk; }
+    this.lastLayer = '';
+    return null;
+  },
+  set(key, value) {
+    memCache.set(key, value);
+    diskCache.set(key, value, ttlForQuery(value?.query || key));
+  },
+  get size() { return memCache.size; }
+};
+
+// ── 源池：出口探测通过就自动并入 ──────────────────────────────────────────
+let activeEngines = SEARCH_ENGINES.slice();
+
+function applyProbe(ok) {
+  if (!ok || typeof ok !== 'object') return;
+  for (const [key, passed] of Object.entries(ok)) {
+    if (!passed) continue;
+    const def = PROBE_ENGINE_DEFS[key];
+    if (!def) continue;
+    if (activeEngines.some((e) => e.name === def.name)) continue;
+    // 换新数组而不是 push：正在进行的搜索持有的是旧引用，别让它在迭代中变长。
+    activeEngines = activeEngines.concat([def]);
+    log(`出口探测：${key} 可用，已并入源池（共 ${activeEngines.length} 个源）`);
+  }
+}
+
+async function probeExits() {
+  const out = {};
+  for (const [key, def] of Object.entries(PROBE_ENGINE_DEFS)) {
+    try {
+      const res = await safeFetch(def.buildUrl('测试'), 20000, { timeoutMs: 4000 });
+      const body = String(res?.body || '');
+      out[key] = res?.statusCode === 200 && body.length > 8000
+        && !/安全验证|captcha|访问异常|Forbidden/i.test(body.slice(0, 3000));
+    } catch { out[key] = false; }
+  }
+  try { health.setProbe(out); } catch { /* 落盘失败不影响 */ }
+  return out;
+}
+
+const probed = (() => { try { return health.probeCache(); } catch { return null; } })();
+if (probed) applyProbe(probed);
+else probeExits().then(applyProbe).catch((error) => log('出口探测失败：', error?.message ?? error));
+
+// ── 工具函数 ──────────────────────────────────────────────────────────────
+/** 把 safeFetch 包成 web-search-lib 需要的 `fetchText(url, timeoutMs, opts)`。 */
+async function fetchText(url, timeoutMs, opts = {}) {
+  // ⚠️ 2026-10-20 修：原来第三个参数（搜狗手机版必须的 mobile UA）在这里被丢掉，
+  // 导致带 headers 的源实际用桌面 UA 请求 → 403 → 一直被冷却。
+  const res = await safeFetch(url, 512000, {
+    timeoutMs: timeoutMs || SOURCE_TIMEOUT_MS,
+    headers: opts?.headers && typeof opts.headers === 'object' ? opts.headers : undefined
+  });
   return { statusCode: res.statusCode, body: res.body };
 }
 
-const server = new McpServer({ name: 'web-search-safe', version: '0.3.0-r1' });
+/** 把一批结果压成一句话要点，供卡片/记忆使用。 */
+function summarizeResults(results) {
+  const r = results[0] || {};
+  const t = String(r.title || '').replace(/\s+/g, ' ').trim();
+  const s = String(r.snippet || '').replace(/\s+/g, ' ').trim();
+  return (s ? `${t}：${s}` : t).slice(0, 90);
+}
+
+function agoText(ms) {
+  const m = Math.max(1, Math.round(ms / 60000));
+  if (m < 60) return `${m} 分钟前`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} 小时前`;
+  return `${Math.round(h / 24)} 天前`;
+}
+
+/** 只显示"像正常网址"的链接：搜狗/360 的跳转链是一长串乱码，贴出来只会占地方。 */
+function prettyUrl(u) {
+  const s = String(u || '').trim();
+  if (!s || s.length > 120) return '';
+  if (/\/link\?url=|[?&]url=[A-Za-z0-9_-]{40,}/.test(s)) return '';
+  try {
+    const x = new URL(s);
+    return x.hostname.includes('.') ? s : '';
+  } catch { return ''; }
+}
+
+/** 把"以前查过"的卡片渲染成给模型看的文本。 */
+function renderRecall(query, card) {
+  const top = Array.isArray(card.top) ? card.top.slice(0, 5) : [];
+  const lines = top.map((r, i) => {
+    const u = prettyUrl(r.url);
+    return `${i + 1}. ${r.title}${u ? ` — ${u}` : ''}`;
+  });
+  const when = card.at ? agoText(Date.now() - Number(card.at)) : '';
+  return `${query}（以前查过${when ? `，${when}` : ''}）\n${lines.join('\n')}`
+    + `${card.summary ? `\n要点：${card.summary}` : ''}`
+    + '\n（这是我自己记着的旧结论，不是刚搜的；要最新信息就再搜一次。）';
+}
+
+const server = new McpServer({ name: 'web-search-safe', version: '0.4.0' });
 
 server.tool(
   'web_search',
-  '只读联网搜索（搜狗/360/Bing 多源并行 + 相关度过滤 + 缓存，通常 1-2 秒）。搜网络用语、梗、黑话、新闻、教程、事实都行；结果已按查询词过滤掉不相关条目，为空时会说明原因。不执行任何本地操作。',
+  '只读联网搜索（AnySearch + 搜狗/360/Bing 多源并行 + 相关度过滤 + 两级缓存，通常 1-2 秒）。搜网络用语、梗、黑话、新闻、教程、事实都行；问过的问题会先查我自己的记录，命中就直接给旧结论。不执行任何本地操作。',
   {
-    query: z.string().describe('要搜索确认的网络用语/黑话/梗'),
+    query: z.string().describe('要搜索确认的网络用语/黑话/梗/事实'),
     limit: z.number().int().min(1).max(10).optional().describe('要几条结果，默认 6')
   },
   async ({ query, limit }) => {
+    const started = Date.now();
     try {
-      const payload = await searchWeb(query, {
-        fetchText, cache: searchCache, limit: limit ?? 8,
-        // 直接透传当前 realm 的 fetch：生产是全局 fetch，测试里是 vm 注入的桩。
+      stats.bump('searches');
+      const q = sanitizeQuery(query);
+      const fetchLimit = limit ?? 8;
+
+      // ① 两级缓存（内存 → 磁盘）：同一个词第二次问几乎都是这一步命中。
+      const exact = cache.get(`${q}::${fetchLimit}`);
+      if (exact) {
+        stats.bump(cache.lastLayer === 'disk' ? 'diskHits' : 'memHits');
+        return {
+          content: [{ type: 'text', text: renderSearchResult({ ...exact, cached: true }, { max: limit ?? 6 }) }]
+        };
+      }
+
+      // ② 卡片召回：近似问题（token 重叠 ≥60%）直接复用旧结论。
+      //    时效性查询（价格/比分/新闻）不召回 —— 旧结论在这种问题上就是错的。
+      if (q && ttlForQuery(q) !== TTL_FAST_MS) {
+        const hit = cards.findByTokens(queryTokens(q), { maxAgeMs: 3 * 86400000 });
+        if (hit) {
+          stats.bump('memHits');
+          return { content: [{ type: 'text', text: renderRecall(q, hit.card) }] };
+        }
+      }
+
+      // ③ 真打网络。
+      const payload = await searchWeb(q, {
+        fetchText, cache, limit: fetchLimit,
+        engines: activeEngines, extraEngines: SEARCH_ENGINES_EXTRA,
         fetchImpl: typeof fetch === 'function' ? fetch : null
       });
-      const text = renderSearchResult(payload, { max: limit ?? 6 });
-      return { content: [{ type: 'text', text }], isError: payload.results.length === 0 };
+      const ms = Date.now() - started;
+      stats.bump(payload.results.length ? 'net' : 'empty', ms);
+
+      // ④ 结果压成卡片（低相关兜底不记 —— 那批线索不值得下次复用）。
+      if (payload.results.length && !payload.lowConfidence) {
+        cards.append({
+          at: Date.now(),
+          query: q,
+          tokens: queryTokens(q),
+          summary: summarizeResults(payload.results),
+          top: payload.results.slice(0, 5).map((r) => ({
+            title: String(r.title || '').slice(0, 80),
+            url: String(r.url || '').slice(0, 200),
+            source: String(r.source || '')
+          }))
+        });
+      }
+
+      return {
+        content: [{ type: 'text', text: renderSearchResult(payload, { max: limit ?? 6 }) }],
+        isError: payload.results.length === 0
+      };
     } catch (error) {
+      stats.bump('empty');
       return {
         content: [{ type: 'text', text: `搜索失败：${error?.message ?? error}` }],
-        isError: true,
+        isError: true
       };
     }
   }
@@ -60,23 +246,38 @@ server.tool(
 
 server.tool(
   'web_fetch',
-  '只读抓取 HTTP(S) 网页正文，返回纯文本前 8000 字符（超出会截断并注明总长）。禁止访问内网/本机地址，不执行任何本地操作。',
-  { url: z.string().describe('要抓取的 http(s) URL') },
-  async ({ url }) => {
-    // [省token 2026-10-19] 原实现把整个 safeFetch 结果 JSON.stringify（正文上限 50000 字符）
-    // 直接塞进上下文：一次抓取 = 2.5 万+ token，几轮就把会话撑到退役线（60k），
-    // 下一轮全价重读。查证其实只需要正文开头 —— 8000 字封顶 + 纯文本，砍掉 80%+。
-    const WEB_FETCH_MAX_CHARS = 8000;
+  '只读抓取 HTTP(S) 网页正文，返回纯文本约 8000 字（长文保头保尾、中间省略）。正文很长时可以传 offset 接着往后读。禁止访问内网/本机地址，不执行任何本地操作。',
+  {
+    url: z.string().describe('要抓取的 http(s) URL'),
+    offset: z.number().int().min(0).optional().describe('从正文第几个字符开始读（默认 0；用于接着读长文）')
+  },
+  async ({ url, offset }) => {
+    // [省token 2026-10-19] 原实现把整个 safeFetch 结果 JSON.stringify（上限 50000 字符）
+    // 塞进上下文：一次抓取 = 2.5 万+ token。8000 字封顶 + 纯文本，砍掉 80%+。
+    // [2026-10-20] 硬截断改成智能截断：保头 68% + 保尾 32%，切点落在句子边界；
+    // 中间省略的部分给 offset，想读就续读，不再"答案在尾部却永远看不到"。
+    const FETCH_CHARS = 8000;
+    const from = Math.max(0, Math.min(Number(offset) || 0, 200000));
+    // 多要一点余量：safeFetch 按字符截断，留 3000 给截断标记和边界调整。
+    const want = Math.min(from + FETCH_CHARS + 3000, 60000);
     try {
-      const result = await safeFetch(url, WEB_FETCH_MAX_CHARS + 4000);
+      stats.bump('fetches');
+      const result = await safeFetch(url, want);
       const body = typeof result?.body === 'string' ? result.body : '';
-      const head = body.slice(0, WEB_FETCH_MAX_CHARS);
-      const more = body.length > WEB_FETCH_MAX_CHARS
-        ? `\n…（正文共 ${body.length} 字符，已截断到前 ${WEB_FETCH_MAX_CHARS}。要更多细节就换更具体的来源再 fetch，或用 web_search 拿摘要）`
+      const slice = body.slice(from);
+      const head = `【HTTP ${result?.statusCode ?? '?'}】${result?.url ?? url}${from > 0 ? `（从第 ${from} 字开始）` : ''}`;
+      if (!slice.trim()) {
+        return {
+          content: [{ type: 'text', text: `${head}\n（已经到正文末尾了：共 ${body.length} 字${result?.truncated ? '，源站响应过长已按上限截断' : ''}）` }]
+        };
+      }
+      const tr = smartTruncate(slice, FETCH_CHARS, from);
+      const tail = tr.truncated
+        ? `\n…（正文共 ${body.length} 字${result?.truncated ? '，源站响应过长已按上限截断' : ''}；想看后面用 offset=${tr.nextOffset}）`
         : (result?.truncated ? '\n…（源站响应过长，已按安全上限截断）' : '');
-      const text = `【HTTP ${result?.statusCode ?? '?'}】${result?.url ?? url}\n${head}${more}`;
-      return { content: [{ type: 'text', text }] };
+      return { content: [{ type: 'text', text: `${head}\n${tr.text}${tail}` }] };
     } catch (error) {
+      stats.bump('fetchFails');
       // 报错也要说人话：DNS 超时/被墙是最常见的一类，直接把"别在同一地址上重试、
       // 换镜像或改用 web_search"写进去，免得她换个 URL 再撞一次。
       const raw = String(error?.message ?? error);
@@ -86,10 +287,7 @@ server.tool(
       const text = unreachable
         ? `抓取失败：本机连不上 ${host || url}（DNS 解析超时/被墙）。别在同一地址上重试；换镜像站，或者直接用 web_search 拿摘要。`
         : `抓取失败：${raw}`;
-      return {
-        content: [{ type: 'text', text }],
-        isError: true,
-      };
+      return { content: [{ type: 'text', text }], isError: true };
     }
   }
 );

@@ -55,6 +55,31 @@ export function resetSourceCooldowns() { sourceCooldownUntil.clear(); }
 export function sourceCooldownLeft(name, now = Date.now()) {
   return Math.max(0, (sourceCooldownUntil.get(name) || 0) - now);
 }
+
+/**
+ * 注入源健康度存储（可选）。生产由 MCP 进程传入落盘实现：
+ * 启动时把"上次记住的冷却/长期死源"播种进进程内冷却表，运行中把每次成功/失败记下来。
+ * 不注入就是纯内存行为（单测、独立调用都不受影响）。
+ */
+let sourceHealthStore = null;
+export function setSourceHealth(health) {
+  sourceHealthStore = health || null;
+  if (!sourceHealthStore) return;
+  try {
+    for (const [name, until] of sourceHealthStore.cooldownMap()) {
+      const u = Number(until) || 0;
+      if (u > 0) sourceCooldownUntil.set(name, Math.max(sourceCooldownUntil.get(name) || 0, u));
+    }
+  } catch { /* 播种失败不该影响搜索 */ }
+}
+export function getSourceHealth() { return sourceHealthStore; }
+
+/** 触发一次冷却：进程内 + 落盘（跨重启记住这个源在挂）。 */
+function setCooldown(name, ms = SOURCE_COOLDOWN_MS) {
+  const until = Date.now() + ms;
+  sourceCooldownUntil.set(name, until);
+  try { sourceHealthStore?.markCooldown(name, until); } catch { /* 落盘失败不影响冷却 */ }
+}
 /**
  * Bing 每个查询并发打几次。
  *
@@ -454,17 +479,112 @@ export function rankResults(list, query, opts = {}) {
   return kept;
 }
 
-/** 合并两个结果列表，按真实地址去重（保留先出现的那个）。 */
-export function mergeResults(base, extra) {
-  const out = Array.isArray(base) ? base.slice() : [];
-  const seen = new Set(out.map((r) => String((r && r.url) || '').replace(/\/+$/, '')));
-  for (const r of Array.isArray(extra) ? extra : []) {
-    const key = String((r && r.url) || '').replace(/\/+$/, '');
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(r);
+/**
+ * 地址规范化：只留"这条结果到底是哪个页面"。
+ * 三个源给同一条结果时，URL 常常只差 utm_*、末尾斜杠、www、http/https 或 #锚点 ——
+ * 原来只 strip 末尾斜杠，去重形同虚设，一屏 6 条里 3 条是同一个页面。
+ */
+const TRACKING_PARAM_RE = /^(utm_|spm|scm|from|share_|ref$|referrer|fbclid|gclid|vd_source|buvid|wfr|ivk_sa|chksm)/i;
+export function normalizeUrl(u) {
+  const s = String(u || '').trim();
+  if (!s) return '';
+  try {
+    const x = new URL(s);
+    x.hash = '';
+    for (const k of [...x.searchParams.keys()]) {
+      if (TRACKING_PARAM_RE.test(k)) x.searchParams.delete(k);
+    }
+    const host = x.hostname.toLowerCase().replace(/^www\./, '');
+    const p = x.pathname.replace(/\/+$/, '');
+    const qs = x.searchParams.toString();
+    return `${host}${p}${qs ? `?${qs}` : ''}`;
+  } catch {
+    return s.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('#')[0].replace(/\/+$/, '').toLowerCase();
   }
+}
+
+/** 标题指纹：去空白/标点/符号后比较，用来抓"同一条内容换了标题措辞"。 */
+export function titleKey(t) {
+  return String(t || '').toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
+}
+
+/** 合并两个结果列表，按规范化地址 + 标题指纹去重（保留先出现的那个）。 */
+export function mergeResults(base, extra) {
+  const out = [];
+  const seen = new Set();
+  const seenTitle = new Set();
+  const push = (r) => {
+    if (!r) return;
+    const key = normalizeUrl(r.url);
+    const tk = titleKey(r.title);
+    if (key && seen.has(key)) return;
+    // 标题完全相同且够长 ⇒ 基本是同一个页面换了入口地址，合并掉。
+    if (tk && tk.length >= 6 && seenTitle.has(tk)) return;
+    if (key) seen.add(key);
+    if (tk && tk.length >= 6) seenTitle.add(tk);
+    out.push(r);
+  };
+  for (const r of Array.isArray(base) ? base : []) push(r);
+  for (const r of Array.isArray(extra) ? extra : []) push(r);
   return out;
+}
+
+/**
+ * 结果该缓存多久：时效性内容不能缓存一天（价格/比分/新闻），
+ * 常识和梗可以（她反复问同一个梗是最典型的命中场景）。
+ */
+const FAST_TTL_RE = /新闻|最新|今天|今日|昨天|刚刚|现在|实时|价格|多少钱|售价|股价|汇率|天气|气温|比分|赛程|战报|票房|销量|上映|开播|更新|版本|发布|政策|几点|开幕|闭幕|名单|排名/;
+const SLOW_TTL_RE = /梗|黑话|是什么|为什么|怎么|如何|意思|出处|区别|教程|原理|历史|百科|介绍|哪些|推荐|评价/;
+export const TTL_FAST_MS = 30 * 60 * 1000;
+export const TTL_SLOW_MS = 24 * 3600 * 1000;
+export const TTL_DEFAULT_MS = 6 * 3600 * 1000;
+export function ttlForQuery(query) {
+  const s = String(query || '');
+  if (FAST_TTL_RE.test(s)) return TTL_FAST_MS;
+  if (SLOW_TTL_RE.test(s)) return TTL_SLOW_MS;
+  return TTL_DEFAULT_MS;
+}
+
+/**
+ * 智能截断：不再"前 8000 字一刀切"。
+ * 长教程/文档的关键结论经常在尾部，硬截断等于把答案丢掉；这里保留头（约 68%）
+ * 和尾（约 32%），中间省略并告诉模型用 offset 续读，切点尽量落在换行/句号上。
+ */
+function cutIndex(text, from, to, dir) {
+  const lo = Math.max(0, Math.min(from, to));
+  const hi = Math.min(text.length, Math.max(from, to));
+  if (hi - lo <= 0) return lo;
+  const window = 400;
+  if (dir === 'back') {
+    for (let i = hi; i >= Math.max(lo, hi - window); i -= 1) {
+      if (/[\n。！？!?.]/.test(text[i - 1] || '')) return i;
+    }
+    return hi;
+  }
+  for (let i = lo; i <= Math.min(hi + window, text.length - 1); i += 1) {
+    if (/[\n。！？!?.]/.test(text[i] || '')) return i + 1;
+  }
+  return lo;
+}
+
+export function smartTruncate(text, maxChars = 8000, baseOffset = 0) {
+  const s = String(text ?? '');
+  const max = Math.max(400, Number(maxChars) || 8000);
+  const base = Math.max(0, Number(baseOffset) || 0);
+  if (s.length <= max) return { text: s, truncated: false, nextOffset: 0, total: s.length };
+  const headLen = Math.floor(max * 0.68);
+  const tailLen = Math.floor(max * 0.32);
+  const headEnd = cutIndex(s, 0, headLen, 'back');
+  const tailStartRaw = Math.max(headEnd, s.length - tailLen);
+  const tailStart = cutIndex(s, tailStartRaw, s.length, 'forward');
+  const omitted = Math.max(0, tailStart - headEnd);
+  const marker = `\n…（中间省略 ${omitted} 字；要看这一段用 offset=${base + headEnd}）\n`;
+  return {
+    text: s.slice(0, headEnd) + marker + s.slice(tailStart),
+    truncated: true,
+    nextOffset: base + tailStart,
+    total: s.length
+  };
 }
 
 /**
@@ -582,6 +702,16 @@ export const SEARCH_ENGINES_EXTRA = [
   { name: 'baidu', buildUrl: (q) => `https://www.baidu.com/s?wd=${encodeURIComponent(q)}`, parse: parseBaiduHtml, attempts: 1, disabled: true }
 ].filter((e) => !e.disabled);
 
+/**
+ * 出口探测用的备用源：本机链路上 DDG 超时、百度返安全验证页，所以默认不进源池。
+ * 但网络环境会变（换网/挂代理），与其让人手改代码，不如启动时探一次：
+ * 通了就自动并入，没通就继续用国内源。探测结果缓存 24 小时，不每次都探。
+ */
+export const PROBE_ENGINE_DEFS = {
+  duckduckgo: { name: 'duckduckgo', buildUrl: (q) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`, parse: parseDuckHtml, attempts: 1 },
+  baidu: { name: 'baidu', buildUrl: (q) => `https://www.baidu.com/s?wd=${encodeURIComponent(q)}`, parse: parseBaiduHtml, attempts: 1 }
+};
+
 /** 简单的 LRU + TTL 缓存。 */
 export class SearchCache {
   constructor(max = CACHE_MAX_ENTRIES, ttlMs = CACHE_TTL_MS) {
@@ -669,7 +799,7 @@ export async function searchWeb(rawQuery, deps = {}) {
   };
 
   /** 打一次某个源；拿不到有效结果就 reject（由调用方汇总）。 */
-  const runOnce = async (engine, seq) => {
+  const runOnceRaw = async (engine, seq) => {
     const label = attemptsOf(engine) > 1 ? `${engine.name}#${seq}` : engine.name;
     const left = sourceCooldownLeft(engine.name);
     if (left > 0) {
@@ -707,12 +837,12 @@ export async function searchWeb(rawQuery, deps = {}) {
       body = String(res?.body || '');
       if (!res || res.statusCode < 200 || res.statusCode >= 300) {
         // 403 / 429 / 5xx：多半是风控，记冷却，别反复撞。
-        sourceCooldownUntil.set(engine.name, Date.now() + SOURCE_COOLDOWN_MS);
+        setCooldown(engine.name);
         throw new Error(`HTTP ${res?.statusCode ?? '??'}`);
       }
       // 风控/异常页的典型特征：页面很短，或者标题里就是这些词。
       if (body.length < 8000 && /访问异常|安全验证|请输入验证码|Forbidden|403 Forbidden|captcha/i.test(body.slice(0, 3000))) {
-        sourceCooldownUntil.set(engine.name, Date.now() + SOURCE_COOLDOWN_MS);
+        setCooldown(engine.name);
         throw new Error('命中风控页');
       }
     } catch (error) {
@@ -736,6 +866,24 @@ export async function searchWeb(rawQuery, deps = {}) {
     }
     if (onSource) onSource(label, { ok: true, ms: Date.now() - t0, count: results.length });
     return { source: engine.name, results };
+  };
+
+  /**
+   * 记录源健康度：成功/失败都记（冷却跳过不算失败 —— 那是我们主动不打，
+   * 记进去会让"上次失败率"永远降不下来，源就再也回不来了）。
+   */
+  const runOnce = async (engine, seq) => {
+    try {
+      const r = await runOnceRaw(engine, seq);
+      try { sourceHealthStore?.record(engine.name, true); } catch { /* */ }
+      return r;
+    } catch (error) {
+      const msg = String(error?.message || '');
+      if (!/冷却中/.test(msg)) {
+        try { sourceHealthStore?.record(engine.name, false); } catch { /* */ }
+      }
+      throw error;
+    }
   };
 
   /**
