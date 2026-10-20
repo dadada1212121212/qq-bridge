@@ -15,6 +15,8 @@ import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { spawn } from 'node:child_process';
 import { priceUsage, resolvePriceTable } from './model-prices.js';
+import { localDayKey } from './day-key.js';
+import { readJsonFile } from './json-file.js';
 
 // ── 配置文件投递（新后台「配置文件」模块）：识别 / 差异 / 深合并 / 历史 ──────
 // 设计：文件丢进来 → 自动识别归属（config 合并 / 人设替换 / 关键词清单）→ 先备份再写。
@@ -78,7 +80,10 @@ function cfgmodDiff(a, b, prefix = '', out = [], depth = 0) {
 }
 
 function cfgmodReadHistory(file) {
-  try { const a = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(a) ? a : []; } catch { return []; }
+  // 统一走 json-file.js：处理 BOM/空文件，解析失败留日志（原来这里静默返回 []，
+  // 历史记录文件坏了等于「改配置的历史凭空消失」，而且没有任何痕迹）。
+  const data = readJsonFile(file, null, { log: (m) => console.error('[console]', m) });
+  return Array.isArray(data) ? data : [];
 }
 
 function cfgmodWriteHistory(file, arr) {
@@ -1983,8 +1988,8 @@ export function createConsoleServer(S) {
               const priced = priceUsage(buckets, { model: j.model, at: t, table });
               // priceUsage 返回 { rates, cost: {cacheHit.., total} } —— 取 cost.total（数值，单位元）
               const cost = Number(priced?.cost?.total) || 0;
-              const dt = new Date(t);
-              const dayStr = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+              // 本地日期键（全仓唯一实现见 day-key.js）：用 toISOString 会让北京时间 0~8 点算到昨天。
+              const dayStr = localDayKey(t);
               let d = byDay.get(dayStr);
               if (!d) { d = { day: dayStr, rounds: 0, cost: 0, miss: 0, hit: 0, out: 0 }; byDay.set(dayStr, d); }
               d.cost += cost; d.miss += buckets.cacheMiss; d.hit += buckets.cacheHit; d.out += buckets.output + buckets.reasoning;
@@ -2039,12 +2044,10 @@ export function createConsoleServer(S) {
         if (req.method === 'GET' && url.pathname === '/api/search/status') {
           // [搜索面板 2026-10-20] 联网搜索的运行状况：今天搜了几次、命中几次缓存、
           // 平均耗时、各源健康度、落盘缓存/卡片台账规模。只读本地文件，不联网。
-          const readJson = (name, fallback) => {
-            try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'state', name), 'utf8')); } catch { return fallback; }
-          };
+          // 统一走 json-file.js（原来这里是第 5 份「读 JSON 容错」实现，不处理 BOM、不留日志）。
+          const readJson = (name, fallback) => readJsonFile(path.join(ROOT, 'state', name), fallback);
           // 本地日期（不是 UTC）：搜索统计按本地日切，用 UTC 的话北京时间 0~8 点会显示"昨天"。
-          const nowD = new Date();
-          const todayKey = `${nowD.getFullYear()}-${String(nowD.getMonth() + 1).padStart(2, '0')}-${String(nowD.getDate()).padStart(2, '0')}`;
+          const todayKey = localDayKey();
           const statsFile = readJson('search-stats.json', { days: {} });
           const raw = statsFile?.days?.[todayKey] || {};
           const num = (v) => Number(v) || 0;
@@ -2093,6 +2096,35 @@ export function createConsoleServer(S) {
             sources,
             probe: { at: Number(srcFile?.probe?.at) || 0, ok: srcFile?.probe?.ok || {} }
           });
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/silent-failures') {
+          // [静默失败台账 2026-10-20] 桥接里被 `catch {}` 吞掉的异常按 tag 计数（含首次/最近时间、
+          // 最后一条错误）。目的：把"某个功能每 60 秒静默失败一次"这种事故变成看得见的一行数字。
+          const data = readJsonFile(path.join(ROOT, 'state', 'silent-failures.json'), null);
+          const tags = Object.entries(data?.tags || {}).map(([tag, row]) => {
+            const lastAt = Number(row?.lastAt) || 0;
+            return {
+              tag,
+              count: Number(row?.count) || 0,
+              firstAt: Number(row?.firstAt) || 0,
+              lastAt,
+              agoMs: lastAt ? Math.max(0, Date.now() - lastAt) : 0,
+              lastMsg: String(row?.lastMsg || '')
+            };
+          }).sort((a, b) => b.count - a.count || b.lastAt - a.lastAt);
+          sendJson({
+            ok: true,
+            total: tags.reduce((sum, r) => sum + r.count, 0),
+            tags: tags.length,
+            top: tags.slice(0, 30)
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/silent-failures/reset') {
+          // 只清台账文件，不动桥接内存里的计数（下一次失败会重新写回来）。
+          atomicWriteJson(path.join(ROOT, 'state', 'silent-failures.json'), { v: 1, tags: {} });
+          sendJson({ ok: true });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/cfgmods/history') {

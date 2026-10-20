@@ -37,6 +37,12 @@ import * as roleCard from '../src/role-card.js';
 import * as snowlumaConn from '../src/snowluma-conn.js';
 import * as broadcastLib from '../src/broadcast-lib.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
+// 2026-10-20 新增（P1 去重）：bridge 现在从这两个模块取 readJsonFile / writeJsonAtomic /
+// localDayString。夹具会把 import 行整体剥掉，所以必须在这里注入，否则 VM 里 undefined。
+import * as jsonFile from '../src/json-file.js';
+import * as dayKey from '../src/day-key.js';
+import * as linkDigest from '../src/link-digest.js';
+import * as silentFailures from '../src/silent-failures.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 export async function bridgeHarness({ config = {}, savedState, globals = {} } = {}) {
@@ -190,6 +196,10 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     ...roleCard,
     ...snowlumaConn,
     ...broadcastLib,
+    ...jsonFile,
+    ...dayKey,
+    ...linkDigest,
+    ...silentFailures,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

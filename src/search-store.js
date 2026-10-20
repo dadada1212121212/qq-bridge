@@ -12,29 +12,23 @@
 //   - 任何写失败只记日志、绝不抛给搜索链路 —— 缓存坏了不该让搜索坏掉。
 import fs from 'node:fs';
 import path from 'node:path';
+import { readJsonFile, writeJsonAtomic as writeJsonAtomicRaw } from './json-file.js';
 
-/** 读 JSON；文件不存在/损坏都返回 fallback（并顺手把坏文件挪走，免得反复读坏）。 */
+/**
+ * 读 JSON；文件不存在/损坏都返回 fallback（并顺手把坏文件挪走，免得反复读坏）。
+ *
+ * 实现已统一到 `json-file.js`（2026-10-20）：本仓原来有 4 份「读 JSON 容错」，
+ * 行为各不相同（有的处理 BOM、有的会把坏文件改名、有的直接返回 null）。
+ * 这里保留 `(file, fallback, log)` 这个老签名，只是把 `quarantine` 打开 ——
+ * 本模块读的都是自己的 `state/` 文件，坏了就该挪走自愈。
+ */
 export function readJsonSafe(file, fallback = null, log = () => {}) {
-  try {
-    const txt = fs.readFileSync(file, 'utf8');
-    if (!txt.trim()) return fallback;
-    return JSON.parse(txt);
-  } catch (error) {
-    if (error?.code !== 'ENOENT') {
-      log(`[搜索存储] 读 ${path.basename(file)} 失败：${error?.message ?? error}`);
-      try { fs.renameSync(file, `${file}.bad`); } catch { /* 挪不动就算了 */ }
-    }
-    return fallback;
-  }
+  return readJsonFile(file, fallback, { log, quarantine: true });
 }
 
-/** 原子写：先写 .tmp 再 rename，避免读到的半截文件。 */
+/** 原子写（tmp → rename，rename 在 Windows 上会重试 EPERM）。实现见 `json-file.js`。 */
 export function writeJsonAtomic(file, data) {
-  const dir = path.dirname(file);
-  fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
-  fs.renameSync(tmp, file);
+  return writeJsonAtomicRaw(file, data);
 }
 
 /**
@@ -208,11 +202,12 @@ export function createSourceHealth({
   };
 }
 
-/** 本地日期键（YYYY-MM-DD）。不能用 toISOString：那是 UTC，北京时间 0~8 点的数据会算到"昨天"。 */
-export function localDayKey(t = Date.now()) {
-  const d = new Date(t);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
+/**
+ * 本地日期键（YYYY-MM-DD）。不能用 `toISOString`：那是 UTC，北京时间 0~8 点的数据会算到"昨天"。
+ * 实现已统一到 `day-key.js`（2026-10-20 之前这个函数在全仓有 4 份拷贝）。
+ */
+import { localDayKey } from './day-key.js';
+export { localDayKey };
 
 /** 按天累计的搜索统计（保留最近 keepDays 天）。 */
 export function createStats({ file, log = () => {}, now = () => Date.now(), keepDays = 14 } = {}) {

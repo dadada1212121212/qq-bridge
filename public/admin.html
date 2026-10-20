@@ -278,6 +278,14 @@ function ts(v) {
   if (isNaN(d.getTime())) return '—';
   return d.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
+// 毫秒差 → "刚刚 / 12 分钟前 / 3 小时前 / 2 天前"（运维页「最近」列用）
+function agoText(ms) {
+  var v = Number(ms) || 0;
+  if (v < 60000) return '刚刚';
+  if (v < 3600000) return Math.floor(v / 60000) + ' 分钟前';
+  if (v < 86400000) return Math.floor(v / 3600000) + ' 小时前';
+  return Math.floor(v / 86400000) + ' 天前';
+}
 function toast(msg, kind) {
   var box = document.createElement('div');
   box.className = 'toast ' + (kind || 'ok');
@@ -997,7 +1005,11 @@ function renderOps() {
     + '<div class="row"><button class="btn danger" data-act="ops-restart">重启桥接</button><a class="btn ghost" href="/" target="_blank">打开旧控制台</a></div>'
     + '<div class="kv" style="margin-top:14px"><div class="k">日志</div><div class="v mono">logs/qqbridge.service.log</div><div class="k">配置</div><div class="v mono">config.json</div><div class="k">知识库</div><div class="v mono">data/kb</div></div></div>'
     + '</div>'
-    + '<div class="card"><h3>最近的工具调用 <span class="tag">只读</span></h3><div id="toolBox"><div class="empty"><span class="spin"></span></div></div></div>';
+    + '<div class="card"><h3>最近的工具调用 <span class="tag">只读</span></h3><div id="toolBox"><div class="empty"><span class="spin"></span></div></div></div>'
+    + '<div class="card"><h3>静默失败 <span class="tag">被吞掉的异常</span></h3>'
+    + '<div class="desc">功能报错但被 catch 掉、不影响主链路的那类失败。次数一直往上涨，说明某个功能在悄悄失效（例如某个定时任务每 60 秒失败一次）。</div>'
+    + '<div id="silentBox"><div class="empty"><span class="spin"></span></div></div>'
+    + '<div class="row" style="margin-top:10px"><button class="btn ghost" data-act="silent-reset">清空台账</button></div></div>';
   $('view').innerHTML = html;
   $('page-sub').textContent = '运维与排障';
   api('/api/socialV2/tool-log').then(function (r) {
@@ -1011,6 +1023,17 @@ function renderOps() {
     });
     box.innerHTML = html2 + '</tbody></table>';
   }).catch(function () { if ($('toolBox')) $('toolBox').innerHTML = '<div class="empty">读取失败</div>'; });
+  api('/api/silent-failures').then(function (r) {
+    var box = $('silentBox');
+    if (!box) return;
+    var list = (r && r.top) || [];
+    if (!list.length) { box.innerHTML = '<div class="empty">还没有静默失败记录 —— 这是好事</div>'; return; }
+    var h = '<table><thead><tr><th>功能</th><th>次数</th><th>最近</th><th>最后一条错误</th></tr></thead><tbody>';
+    list.forEach(function (e) {
+      h += '<tr><td>' + esc(e.tag) + '</td><td class="mono">' + n(e.count) + '</td><td class="hint">' + esc(agoText(e.agoMs)) + '</td><td class="hint mono">' + esc(String(e.lastMsg || '').slice(0, 70)) + '</td></tr>';
+    });
+    box.innerHTML = h + '</tbody></table>';
+  }).catch(function () { if ($('silentBox')) $('silentBox').innerHTML = '<div class="empty">读取失败</div>'; });
   return Promise.resolve();
 }
 
@@ -1387,6 +1410,12 @@ var ACTIONS = {
     api('/api/test-send', { method: 'POST', body: { kind: kind, id: Number(id), message: message } })
       .then(function (r) { $('ops-msg-out').textContent = '已发送，message_id=' + (r.message_id || '?'); toast('测试消息已发出'); })
       .catch(function (err) { $('ops-msg-out').textContent = err.message; toast(err.message, 'err'); });
+  },
+  'silent-reset': function () {
+    if (!confirm('清空静默失败台账？（只是把计数清零，不影响功能）')) return;
+    api('/api/silent-failures/reset', { method: 'POST', body: {} })
+      .then(function () { toast('台账已清空'); return renderOps(); })
+      .catch(function (err) { toast(err.message, 'err'); });
   },
   'ops-restart': function () {
     if (!confirm('重启桥接？会断开当前回合，约 10 秒恢复。')) return;

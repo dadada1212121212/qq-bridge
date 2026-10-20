@@ -28,20 +28,13 @@ const LM_STOP_WORDS = new Set([
   '真的', '有点', '一点', '今天', '昨天', '明天', '大家', '什么'
 ]);
 
-/** 本地时区的 YYYY-MM-DD。offsetDays=1 就是昨天。 */
-export function localDayString(offsetDays = 0, base = null) {
-  const d = base ? new Date(base) : new Date();
-  if (offsetDays) d.setDate(d.getDate() - Number(offsetDays));
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-function dayStartTs(day) {
-  return new Date(`${day}T00:00:00`).getTime();
-}
-
-function daysAgoOf(day, now) {
-  return Math.max(0, Math.round((now - dayStartTs(day)) / 86400000));
-}
+/**
+ * 本地时区的 YYYY-MM-DD。offsetDays=1 就是昨天。
+ * 实现已统一到 `day-key.js`（2026-10-20）：这个函数原来在 4 个文件里各有一份，
+ * 而"UTC 还是本地"改漏一处就会让统计/控制台对不上日期。
+ */
+import { localDayString, daysAgoOf } from './day-key.js';
+export { localDayString };
 
 /** 时间描述：7 天内 → N天前；否则 N周前/N个月前/N年前。 */
 function agoLabel(day, now) {

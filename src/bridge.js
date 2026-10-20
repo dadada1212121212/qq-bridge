@@ -25,6 +25,9 @@ import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { safeFetch, safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { extractLinks, htmlToText, extractTitle, formatLinkDigest } from './link-digest.js';
+import { readJsonFile, writeJsonAtomic } from './json-file.js';
+import { createSilentFailures } from './silent-failures.js';
+import { localDayString } from './day-key.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
@@ -45,7 +48,9 @@ import { createTokenLedger } from './token-ledger.js';
 // [patch 暴躁] 贴吧老哥模式：判定纯逻辑在 grump-mode.js（被 @ 塞长文 / 刷屏 / 反复问 / 离谱问题）
 import { resolveGrumpCfg, grumpSignalsV2, formatGrumpLineV2, grumpMoodNoteV2 } from './grump-mode.js';
 import { createMemoryDb } from './memory-db.js';
-import { createLongMemory, localDayString } from './long-memory.js';
+// localDayString 现在直接从 day-key.js 取（全仓唯一实现）；long-memory 仍然 re-export 它，
+// 但桥接不该为了一个日期函数去 import 那个会拖 node:sqlite 的模块。
+import { createLongMemory } from './long-memory.js';
 import { createConsoleServer } from './console-server.js';
 import { createWakePrompt } from './wake-prompt.js';
 import { createSocialState } from './social-state.js';
@@ -133,14 +138,11 @@ function normalizeModeInput(value) {
 // 读取 JSON 文件并容错：Windows 下常见 UTF-8 BOM（\uFEFF）会令 JSON.parse 失败。
 // required=true 时文件缺失或解析失败直接抛错（用于启动必需配置，fail-fast）。
 function readJsonSafe(file, fallback, required = false) {
-  try {
-    let text = fs.readFileSync(file, 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    return JSON.parse(text);
-  } catch (error) {
-    if (required) throw new Error(`配置文件读取/解析失败：${file}（${error?.message ?? error}）`);
-    return fallback;
-  }
+  // 实现已统一到 json-file.js（2026-10-20）：本仓原来有 4 份「读 JSON 容错」，
+  // 只有这一份处理 BOM 和 required。签名保持不变（30+ 个调用点不用改），
+  // quarantine 保持关闭 —— 桥接会读别的工具拥有的文件（../our-free-model/*.json），
+  // 不能因为对方文件坏了就把人家的文件改名。
+  return readJsonFile(file, fallback, { required, log });
 }
 
 /**
@@ -184,18 +186,10 @@ function renameWithRetry(from, to, attempts = 4) {
   throw lastError;
 }
 
-// 原子写 JSON 文件：先写唯一临时文件再 rename，避免进程中断写坏配置，也避免固定临时名被并发/符号链接攻击利用。
+// 原子写 JSON 文件：实现统一到 json-file.js（唯一临时文件名 + 0600 + rename EPERM 重试）。
+// 这里保留函数名是因为桥接有 40+ 个调用点，改名只是噪音。
 function atomicWriteJson(file, obj) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
-    renameWithRetry(tmp, file);
-  } catch (error) {
-    // 失败时别把随机名临时文件留在 state/ 里当垃圾。
-    try { fs.unlinkSync(tmp); } catch {}
-    throw error;
-  }
+  writeJsonAtomic(file, obj, { pretty: true });
 }
 
 // 原子写文本文件。
@@ -9222,7 +9216,7 @@ async function main() {
     // [链接顺手读] 消息里带 URL 就后台抓一份摘要（不 await，绝不拖慢入库）。
     // ⚠️ 用未截断的 plainContent，别用 msg.plain：后者被 truncateText 砍到 200 字，
     // 长消息尾部的 URL 会被截半截，抓的是一个不存在的地址。
-    try { noteLinksV2(key, plainContent ?? textContent ?? ''); } catch { /* 抓不到就算了 */ }
+    try { noteLinksV2(key, plainContent ?? textContent ?? ''); } catch (error) { swallowV2('链接摘要入队', error, key); }
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -10206,7 +10200,7 @@ async function main() {
     // [省token] 瘦提示词判定一次、两处复用（这里 build 一次用于日志，deliverPromptNow 会重建）。
     const wakeSlim = shouldSlimWakeV2(key, st, reason);
     // [链接顺手读] 这条消息带链接且摘要还在路上时，最多等 2.5 秒再构建提示词。
-    try { await waitLinkDigestV2(key, 2500); } catch { /* 等不到就算了 */ }
+    try { await waitLinkDigestV2(key, 2500); } catch (error) { swallowV2('链接摘要等待', error, key); }
     const promptText = buildWakePromptV2(key, reason, { slim: wakeSlim });
     log(`[reserved2] 唤醒 ${key}（${reason}）${wakeSlim ? ' [瘦提示词]' : ''}`);
     // 先让对面看到「正在输入」，再真正开始跑回合 —— 这一回合要几十秒，静默几十秒再蹦出一整段
@@ -10884,7 +10878,7 @@ async function main() {
           source: 'search',
           onlyIfNew: true
         });
-      } catch { id = null; }
+      } catch (error) { id = null; swallowV2('搜索卡片入库', error, q); }
       // 写库失败就别推游标（下次重试这张卡），否则这条记录直接消失。
       if (!id) continue;
       added += 1;
@@ -10930,27 +10924,34 @@ async function main() {
   }
 
   const PROMISE_INTERVAL_MS_V2 = 60000;
+  // [静默失败台账] 这里吞掉的异常一律走它：既打日志（限流）又按 tag 计数落盘，
+  // 控制台运维页能直接看到"哪个功能一直在失败"。见 src/silent-failures.js 的事故说明。
+  const silentFailuresV2 = createSilentFailures({
+    file: path.join(STATE_DIR, 'silent-failures.json'),
+    log: (...args) => log(...args)
+  });
+  const swallowV2 = (tag, error, detail) => silentFailuresV2.swallow(tag, error, detail);
   function promiseDueTickV2() {
     if (cfg.socialV2?.enabled === false || socialV2.paused) return;
     // [养鱼] 每日巡园检查搭同一只 60s tick（日期判重，一天最多一次）。
-    try { biliStrollTickV2(); } catch (error) { log(`[巡园] tick 异常：${error?.message ?? error}`); }
+    try { biliStrollTickV2(); } catch (error) { swallowV2('巡园 tick', error); }
     // [养鱼·追更] 关注的 UP 主有没有更新（只读 API，空闲时段窗口内一天最多查几次）。
-    try { biliFollowTickV2(); } catch (error) { log(`[追更] tick 异常：${error?.message ?? error}`); }
+    try { biliFollowTickV2(); } catch (error) { swallowV2('追更 tick', error); }
     // [养鱼·评论区] 她发的评论有没有收到新回复（同样只读，搭同一只 tick）。
-    try { biliReplyTickV2(); } catch (error) { log(`[评论区] tick 异常：${error?.message ?? error}`); }
+    try { biliReplyTickV2(); } catch (error) { swallowV2('评论区 tick', error); }
     // [群友生日] 印象档案里记过生日的人，今天生日的主动祝寿。
-    try { birthdayWakeTickV2(); } catch (error) { log(`[生日] tick 异常：${error?.message ?? error}`); }
+    try { birthdayWakeTickV2(); } catch (error) { swallowV2('生日 tick', error); }
     // [搜索沉淀] 她联网查过的东西进记忆库（10 分钟一次，跨进程读文件）。
-    try { searchCardIngestTickV2(); } catch (error) { log(`[搜索沉淀] tick 异常：${error?.message ?? error}`); }
+    try { searchCardIngestTickV2(); } catch (error) { swallowV2('搜索卡片入库', error); }
     // [记忆巩固] 凌晨把碎片合并/去重/限量，一天一次。
-    try { memoryConsolidateTickV2(); } catch (error) { log(`[记忆巩固] tick 异常：${error?.message ?? error}`); }
+    try { memoryConsolidateTickV2(); } catch (error) { swallowV2('记忆巩固', error); }
     for (const key of socialV2.conversations.keys()) {
       if (!isSessionAllowedInCurrentMode(key)) continue;
       const st = socialV2.conversations.get(key);
       const now = Date.now();
       // [拟人] 事件跟进和待办共用这只 60s 看门狗：都是「到点该主动说一件事」，语义同族。
       let followUpDue = 0;
-      try { followUpDue = followUpDueScanV2(st, now); } catch (error) { log(`[拟人] 事件跟进扫描异常 ${key}:`, error?.message ?? error); }
+      try { followUpDue = followUpDueScanV2(st, now); } catch (error) { swallowV2('事件跟进扫描', error, key); }
       const list = Array.isArray(st?.promises) ? st.promises : [];
       if (!list.length && !followUpDue) continue;
       let due = 0;
@@ -10974,7 +10975,7 @@ async function main() {
   }
   function startPromiseWatchV2() {
     setInterval(() => {
-      try { promiseDueTickV2(); } catch (error) { log(`[待办] 看门狗异常：${error?.message ?? error}`); }
+      try { promiseDueTickV2(); } catch (error) { swallowV2('待办看门狗', error); }
     }, PROMISE_INTERVAL_MS_V2).unref?.();
     log('[待办] 到期待办看门狗已启动（每 60s 扫一次）');
   }
@@ -13309,7 +13310,8 @@ async function main() {
   // 免费模型插件的状态目录：同样别写死本机绝对路径，默认取仓库同级，可用 config.json 覆盖。
   const FREE_MODEL_DIR = cfg.freeModel?.dir || path.join(ROOT, '..', 'our-free-model');
   let modelHealthLastAt = 0;
-  function readJsonSafe(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
+  // ⚠️ 这里原来还有一个内层 readJsonSafe（不处理 BOM、失败静默返回 null），
+  // 与外层同名实现并存 —— 已删，统一用上面的顶层实现。
   function pickFallbackModel() {
     const avail = readJsonSafe(FREE_MODEL_DIR + '/availability.json');
     const stats = readJsonSafe(FREE_MODEL_DIR + '/stats.json');

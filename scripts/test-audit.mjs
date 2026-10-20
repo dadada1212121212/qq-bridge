@@ -178,6 +178,12 @@ const tests = [
   'test-agent-preset-patches.mjs',
   // [v2 等待] 回合等待/超时的纯逻辑段（真连 DSH 的那半在 test-dsh-v2-wait，不进审计）。
   'test-v2-wait.mjs',
+  // [底层统一层 2026-10-20] 所有状态文件都走 json-file，所有"今天几号"都走 day-key。
+  // 这两条钉的是"曾经各写各的、行为还不一样"的几个分支：BOM / 空文件 / required /
+  // quarantine / 本地日期 vs UTC。
+  'test-json-file.mjs',
+  // [静默失败台账] 把 `catch {}` 吞掉的异常变成看得见的计数（跨重启保留 + 日志限流）。
+  'test-silent-failures.mjs',
 ];
 let failed = 0;
 for (const test of tests) {
