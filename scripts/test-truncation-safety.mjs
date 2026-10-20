@@ -57,7 +57,9 @@ if (fail === 0) console.log('  ✅ 没有发现裸 slice 截断');
 console.log('## 投递/发送咽喉必须兜底 stripLoneSurrogates');
 const bridge = fs.readFileSync(path.join(SRC, 'bridge.js'), 'utf8');
 const checks = [
-  ['提示词投递 withSlangContext 兜底', /function withSlangContext[\s\S]{0,900}?return stripLoneSurrogates\(/.test(bridge)],
+  // 900 字符的窗口太窄：withSlangContext 里后来加了「工具参数提醒」一整段注释，
+  // 到 return 的间距已经超了 ⇒ 这条断言长期假红（代码其实是对的）。
+  ['提示词投递 withSlangContext 兜底', /function withSlangContext[\s\S]{0,2400}?return stripLoneSurrogates\(/.test(bridge)],
   ['QQ 发送 sendToQQ 兜底', /function sendToQQ[\s\S]{0,400}?stripLoneSurrogates\(/.test(bridge)],
   ['冻结 recap 生成时洗净', /st\.recap = \{ text/.test(bridge) && /text = stripLoneSurrogates\(text\)/.test(bridge)],
   ['冻结 recap 读缓存时洗净（且把清洗结果就地写回，避免每轮重洗）', /const clean = stripLoneSurrogates\(rec\.text\)[\s\S]{0,600}?return clean;/.test(bridge) && /if \(clean !== rec\.text\)[\s\S]{0,300}?saveSocialV2State\(\)/.test(bridge)]

@@ -18,6 +18,10 @@
 //   slot     被哪个槽位认领（'' = 还没人管 | 'a' = 主会话 | 'b' = 并发补答会话）
 //   claimAt  认领时刻；tries 已经带着它唤醒过几次；done 0 | 'answered' | 'dropped'
 
+// 唯一的外部依赖：截断工具（纯函数，零副作用）。原来这里写着「零依赖」，但裸 slice 会切坏
+// emoji —— 宁可多一行 import，也不要给提示词制造孤代理项。
+import { truncateText } from './md-to-plain.js';
+
 export const DEFAULT_CONCURRENCY_CFG = {
   // 总开关。关掉就退回「一个群一个会话」的老行为，其余逻辑全部不参与。
   enabled: true,
@@ -105,7 +109,9 @@ export function isDirectedReason(reason) {
 export function cleanAskText(text, max = DEFAULT_CONCURRENCY_CFG.askTextMax) {
   let s = String(text ?? '');
   s = s.replace(/\[CQ:[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim();
-  if (max > 0 && s.length > max) s = s.slice(0, max) + '…';
+  // 这段正文会进提示词，群友消息里 emoji 很常见：必须走 truncateText，
+  // 裸 slice 切在代理对中间会留孤代理 ⇒ 请求体 400，而且毒文本还会被存进会话帧。
+  if (max > 0 && s.length > max) s = truncateText(s, max) + '…';
   return s;
 }
 

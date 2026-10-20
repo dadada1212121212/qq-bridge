@@ -1019,7 +1019,7 @@ export function createMemoryDb({ file, tokenUsageFile = '', log = () => {}, maxF
         let memBudget = 450;
         for (const f of picked) {
           let t = String(f.text || '').replace(/\s+/g, ' ').trim();
-          if (t.length > 90) t = t.slice(0, 89) + '…';
+          if (t.length > 90) t = truncateText(t, 89) + '…';
           if (memBudget - t.length < 0) break;
           memBudget -= t.length;
           lines.push('- ' + t);

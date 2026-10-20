@@ -446,7 +446,7 @@ export function createConsoleServer(S) {
       if (now - (tokenMismatchLogAt.get(k) || 0) > 60000) {
         tokenMismatchLogAt.set(k, now);
         const given = String(token ?? '');
-        log(`[auth] ${k} agent token 不匹配（收到 ${given ? given.slice(0, 8) + '…' : '空'}，当前 ${String(st?.agentToken || '').slice(0, 8)}…）`);
+        log(`[auth] ${k} agent token 不匹配（收到 ${given ? truncateText(given, 8) + '…' : '空'}，当前 ${truncateText(String(st?.agentToken || ''), 8)}…）`);
       }
       return false;
     };

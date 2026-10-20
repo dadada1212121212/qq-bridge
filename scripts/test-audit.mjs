@@ -147,6 +147,22 @@ const tests = [
   'test-astrbot-watch.mjs',
   'test-fresh-session.mjs',
   'test-thinking-filler.mjs',
+  // ── 2026-10-20 补登记：这些脚本一直在仓库里、却从来没进过审计 ──────────────
+  // 背景：审计是**显式白名单**，新写的测试不登记就等于没有。`test-truncation-safety`
+  // 就是活证据 —— 它报了 4 处「裸 slice + 省略号」和 1 处假红断言，没人跑所以没人知道。
+  // 下面这些已逐个跑过：纯离线、无外部依赖、耗时都 < 15 秒。
+  // [截断安全] 源码级扫描：不许 slice(0,N)+'…'（切开代理对 ⇒ 请求体 400 且毒文本进会话帧）。
+  'test-truncation-safety.mjs',
+  // [搜索磁盘层] 落盘缓存 / 源健康度 / 按天统计 / 卡片台账（全部走临时目录，不碰 state/）。
+  'test-search-store.mjs',
+  // [链接顺手读] extractLinks / htmlToText / formatLinkDigest 纯逻辑。
+  'test-link-digest.mjs',
+  // [群聊并发] 点名台账 / 清文本截断（cleanAskText 刚修过代理对）。
+  'test-group-tools.mjs', 'test-social-mechanisms.mjs', 'test-concurrency-urgent.mjs',
+  // [记忆库] 印象段单条 90 字封顶（刚修过代理对）+ 记忆读写/去重。
+  'test-memory-db.mjs',
+  // [省步] 步数提醒阈值与文案。
+  'test-step-nudge.mjs',
 ];
 let failed = 0;
 for (const test of tests) {

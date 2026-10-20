@@ -18,6 +18,7 @@
 //   - 不引向量库/embedding：中文 2 字滑窗 + 词面匹配对这个量级（每天 ≤N 条 episode）足够，
 //     与 memory-db.js 既有检索路线一致（AstrBot 稀疏检索那一半）。
 import { DatabaseSync } from 'node:sqlite';
+import { truncateText } from './md-to-plain.js';
 
 const LM_STOP_WORDS = new Set([
   '的', '了', '是', '我', '你', '他', '她', '它', '在', '有', '和', '就', '不', '也', '都', '这', '那',
@@ -172,7 +173,8 @@ export function createLongMemory({ file, log = () => {}, maxSummaryChars = 260 }
     if (firstLine) summary += `。开头在聊「${firstLine}」`;
     if (lastLine && lastLine !== firstLine) summary += `，后来聊到「${lastLine}」`;
     summary += '。';
-    if (summary.length > maxSummaryChars) summary = summary.slice(0, maxSummaryChars - 1) + '…';
+    // 摘要是从群聊原文里摘的，emoji 很常见；裸 slice 会切出孤代理 ⇒ 落库/进提示词都成毒文本。
+    if (summary.length > maxSummaryChars) summary = truncateText(summary, maxSummaryChars - 1) + '…';
     const importance = signals.importanceHint || scoreImportance({ facts, messages, events, participants });
     const keywords = [...new Set([...participants, ...topics, ...extractKeywords([summary], 4)])];
     stmts.upsert.run(String(key), String(day), participants.join('、'), JSON.stringify(topics), summary, mood, importance, JSON.stringify(keywords), now, now);
