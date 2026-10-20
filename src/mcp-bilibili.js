@@ -162,9 +162,10 @@ server.tool(
   async ({ user, limit }) => {
     try {
       const r = await bili.userVideos(user, { limit: limit ?? 5 });
-      const text = `【B 站·${r.name || user} 的最近投稿】\n` + (r.count.length
-        ? r.count.map((v, i) => formatVideo(v, i + 1)).join('\n')
-        : '（这个 UP 最近没有投稿）');
+      const header = `【B 站·${r.name || user} 的最近投稿】`;
+      const text = r.count.length
+        ? formatVideos(r.count, { header })
+        : header + '\n（这个 UP 最近没有投稿）';
       return { content: [{ type: 'text', text }], isError: r.count.length === 0 };
     } catch (error) {
       return { content: [{ type: 'text', text: `查询失败：${error?.message ?? error}` }], isError: true };

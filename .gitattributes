@@ -1,0 +1,49 @@
+# 换行符与二进制策略（2026-10-20 引入，质量体检 P2）
+#
+# 这个项目只在 Windows 上跑，但仓库是公开的，可能被 Linux/macOS clone。
+# 换行符本来交给 core.autocrlf 管，但那只对「本机」有效 —— 换台机器、或者从 Linux
+# clone 下来再拷回 Windows，批处理文件就可能变成 LF 而跑不起来。
+#
+# 所以这里只钉死「错了会出事」的几类，其余一概不管。
+# 特别注意：**不要写 `* text=auto`**。实测它和 core.autocrlf 交互时会改变整仓文件
+# 的文本判定，一次 checkout 就能刷出上百个「内容没变却显示已修改」的假 diff。
+# 换行符归一化继续由 autocrlf 负责，这里只做加法。
+
+# ── 必须是 CRLF ────────────────────────────────────────────────────────────
+# cmd.exe 处理 LF-only 的 goto 标签、括号块、多行 if 有已知问题。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.vbs text eol=crlf
+
+# ── 二进制 ────────────────────────────────────────────────────────────────
+# 声明 binary 有两个作用：不做换行符转换、git diff 不把它当文本逐行比。
+# （语音 .silk/.amr、表情图、字体这些若被当文本处理，diff 会输出一堆乱码。）
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.ttf  binary
+*.otf  binary
+*.woff  binary
+*.woff2 binary
+*.mp3  binary
+*.wav  binary
+*.amr  binary
+*.silk binary
+*.zip  binary
+*.gz   binary
+*.7z   binary
+*.db   binary
+*.sqlite  binary
+*.sqlite3 binary
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.pdf  binary
+
+# ── 锁文件 ────────────────────────────────────────────────────────────────
+# package-lock.json 有几万行，不参与 diff 统计，也别让 GitHub 把它算进语言占比。
+package-lock.json -diff linguist-generated=true

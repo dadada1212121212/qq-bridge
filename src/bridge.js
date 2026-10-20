@@ -5273,7 +5273,6 @@ async function main() {
     // （如 "\u0000UR" + "L0\u0000"），后面的还原正则 \u0000URL(\d+)\u0000 就匹配不上 →
     // **URL 整条丢失 + 裸 NUL + 字面量 "URL0" 被发进 QQ 消息**（实测 13 个偏移里 5 个损坏）。
     // 这里改成按占位符边界切分，宁可某段略超 max 也绝不切碎占位符。
-    const PLACEHOLDER_ANY = /\u0000URL\d+\u0000/;
     const PLACEHOLDER_ALL = /\u0000URL\d+\u0000/g;
     /** 把 token 切成 {text, isPlaceholder} 序列（占位符整体一块，绝不拆） */
     const splitByPlaceholder = (tok) => {
@@ -6144,6 +6143,9 @@ async function main() {
     if (slip && slip.messageId) {
       const recallMs = Math.max(400, Number(cfg.socialV2?.humanize?.typoRecallDelayMs) || 1600);
       last = sendQueueV2(key, async () => {
+        // 「愣一下」在这里兑现：真人发现打错字不会 0 秒就撤回，会先盯着看一会儿。
+        // 占住本会话的发送队列是对的 —— 这 1.6 秒里她本来也不该接着发别的。
+        await sleep(recallMs);
         try {
           await onebotDeleteMsg(slip.messageId);
           log(`[手滑] ${key} 撤回了一条打错的消息，重发：${truncateText(slip.correct, 40)}`);
@@ -11639,10 +11641,7 @@ async function main() {
       clearTimeout(st.replyCheckTimer);
       st.replyCheckTimer = null;
     }
-    if (st.proactiveTimer) {
-      clearTimeout(st.proactiveTimer);
-      st.proactiveTimer = null;
-    }
+    cancelProactiveCheckV2(key);
     if (Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons.length = 0;
   }
 

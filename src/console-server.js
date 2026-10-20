@@ -1326,7 +1326,8 @@ export function createConsoleServer(S) {
           const idx = S.slangEntries.findIndex((e) => e.id === id);
           if (idx < 0) { sendJson({ ok: false, error: '黑话不存在' }, 404); return; }
           const body = await readBody();
-          const entry = { ...slangEntries[idx] };
+          // 复制一份再改：直接改 S.slangEntries[idx] 会让校验失败时留下半改状态。
+          const entry = { ...S.slangEntries[idx] };
           if (body.content !== undefined) entry.content = String(body.content ?? '').trim();
           if (body.content !== undefined && S.slangEntries.some((e) => e.id !== id && e.content === entry.content)) {
             sendJson({ ok: false, error: `黑话「${entry.content}」已存在` }, 400);
@@ -2911,9 +2912,12 @@ export function createConsoleServer(S) {
               return;
             }
           }
+          // st / now 必须在 try 外声明：catch 里要按同一个 now 回滚预占的发送额度，
+          // 若在 try 内用 const 声明，catch 根本访问不到（块级作用域）⇒ 发送失败时
+          // 抛 ReferenceError，连 500 都发不回去。getSocialV2State 是纯内存读，不会抛。
+          const st = getSocialV2State(key);
+          const now = Date.now();
           try {
-            const st = getSocialV2State(key);
-            const now = Date.now();
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
             const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
@@ -6093,9 +6097,10 @@ export function createConsoleServer(S) {
           const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
           if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
           if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
+          // 同上：catch 要按同一个 now 回滚，所以提到 try 外。
+          const st = getSocialV2State(key);
+          const now = Date.now();
           try {
-            const st = getSocialV2State(key);
-            const now = Date.now();
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
             const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;

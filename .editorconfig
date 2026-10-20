@@ -1,0 +1,19 @@
+# 编辑器基础约定（2026-10-20 引入，质量体检 P2）
+#
+# 只写「几乎所有编辑器都认、且不会造成大规模改动」的几条。
+# 换行符故意不在这里定：交给 .gitattributes + core.autocrlf 管，
+# 因为编辑器这边一旦设 end_of_line = lf，下次随便保存一个文件就会整篇换行符翻新，
+# 那种 diff 谁都不想 review。
+
+root = true
+
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Markdown 里行尾两个空格是「硬换行」，删了会改变渲染结果。
+[*.md]
+trim_trailing_whitespace = false

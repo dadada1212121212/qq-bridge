@@ -10,6 +10,8 @@
   },
   "scripts": {
     "start": "node src/bridge.js",
+    "lint": "eslint src scripts",
+    "test": "node scripts/test-audit.mjs",
     "test:audit": "node scripts/test-audit.mjs",
     "test:token": "node scripts/test-token-economy.mjs && node scripts/test-reply-wait.mjs && node scripts/test-qq-model-view.mjs && node scripts/test-qq-preset-contract.mjs",
     "test:tokens": "node scripts/test-token-usage.mjs",
@@ -82,5 +84,8 @@
     "@snowluma/sdk": "^1.14.20",
     "js-yaml": "^4.3.2",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "eslint": "^10.13.0"
   }
 }
