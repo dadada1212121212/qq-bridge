@@ -110,6 +110,13 @@ const PTC_PREFIX = [
   '- QQ 工具的名字与参数不变（mcp__snowluma__qq_send_message 这些），只是调用入口变成了 run_code；',
   '  具体写法以系统提示里 run_code 的说明为准，两种写法（直接调工具 / 写 run_code）都可以用，挑顺手的。',
   '- 分条、令牌、分寸那些规则一条都没变：该几条还是几条，令牌照传。',
+  // 2026-10-20 实测：PTC 下她第一笔发送只写了 token、漏了 key，然后花了 9 次调用猜参数名。
+  // run_code 里参数名得自己敲，没有「填空」那层兜底，所以最常用的几个必须点名写清。
+  '- 常用工具的必填参数（写 run_code 时照这个敲，别猜）：',
+  '  qq_send_message { key, token, messages }；qq_get_prompt { key, token }；',
+  '  qq_get_recent_messages { key, token }；qq_wait_for_messages { key, token }。',
+  '  key 形如 private:3796180411 / group:群号，token 是另一串 48 位十六进制——两个都要传，别把令牌填进 key。',
+  '  （漏了 key 也不会挂：桥接会按 token 反查唯一对应的会话，照常发出去。）',
   '- run_code 是主人才有的能力，在任何群聊里都没有这个工具，也别提它。',
 ].join('\n');
 

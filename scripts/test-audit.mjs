@@ -168,6 +168,8 @@ const tests = [
   'test-stickers.mjs',
   // [MCP 安全] 工具白名单/参数校验/越权拒绝 —— 安全相关，必须在每次回归里跑。
   'test-mcp-safe.mjs', 'test-mcp-host.mjs', 'test-mcp-servers-stdio.mjs',
+  // [MCP 安全] 模型漏填 key 时按令牌自愈（2026-10-20 事故回归）。
+  'test-mcp-key-selfheal.mjs',
   // [B 站养鱼] 配额/追更/评论纯逻辑。
   'test-bilibili-lib.mjs',
   // [小游戏 / 回合游戏 / 点歌] 纯逻辑 + 端点契约。

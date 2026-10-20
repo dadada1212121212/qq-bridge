@@ -487,15 +487,28 @@ export function createConsoleServer(S) {
     // 令牌两种长度都见过：首次铸造 `randomBytes(16)` = 32 位，轮换后 `randomBytes(24)` = 48 位
     // （用户实测报错里那串就是 48 位）。别只认 48 位，否则新会话的自愈会失效。
     const TOKEN_SHAPED_RE = /^[0-9a-f]{32,64}$/i;
+    /** 令牌 → 唯一会话 key；对应不到、或对应到多个（理论上不该发生）时返回 null，绝不猜。 */
+    function keyFromTokenOnly(token) {
+      if (!token) return null;
+      let hit = null;
+      for (const [convKey, convSt] of socialV2.conversations) {
+        if (!convSt?.agentToken || !tokenEq(token, convSt.agentToken)) continue;
+        if (hit) return null;
+        hit = convKey;
+      }
+      return hit;
+    }
     function keyFromTokenShaped(rawKey, token) {
       const k = String(rawKey ?? '').trim();
+      // [patch 漏填 key 2026-10-20] key **整个没填**（不是填错）也要自愈。
+      // 实测：PTC 模式下模型第一笔 qq_send_message 只写了 token、没写 key，MCP 的 zod 在
+      // 入口就 -32602 挡了，这里的自愈根本没机会跑 —— 她只好暴力试参数名，9 次调用才恢复。
+      // 令牌只对应唯一一个会话，按它反查不越权（调用方本来就持着这枚令牌）。
+      if (!k) return keyFromTokenOnly(token);
       if (!TOKEN_SHAPED_RE.test(k)) return null;
       // 必须与请求自带的令牌逐字节相同：否则「key 填了别人的令牌」这种组合不能放行。
       if (!token || !tokenEq(k, String(token))) return null;
-      for (const [convKey, convSt] of socialV2.conversations) {
-        if (convSt?.agentToken && tokenEq(k, convSt.agentToken)) return convKey;
-      }
-      return null;
+      return keyFromTokenOnly(k);
     }
     /** 请求体里的 key 被误填成令牌时改回真实 key；改了就记一行日志，便于发现提示词回归。 */
     function repairAgentKeyInBody(body, token, where) {
@@ -503,7 +516,10 @@ export function createConsoleServer(S) {
       let changed = false;
       const fixed = keyFromTokenShaped(body?.key, token);
       if (fixed) {
-        log(`[patch key 误填] ${where || ''} 的 key 是会话令牌，已按令牌反查为 ${fixed}`);
+        // 区分「填错」和「没填」：前者是提示词回归，后者是模型漏参数，排查方向完全不同。
+        log(String(body?.key ?? '').trim()
+          ? `[patch key 误填] ${where || ''} 的 key 是会话令牌，已按令牌反查为 ${fixed}`
+          : `[patch 漏填 key] ${where || ''} 没带 key，已按令牌反查为 ${fixed}`);
         body.key = fixed;
         changed = true;
       }
@@ -531,11 +547,16 @@ export function createConsoleServer(S) {
       }
       // [patch key 误填 2026-10-18] GET 端点（qq_get_prompt / qq_get_unread_messages / qq_social_state
       // / qq_wait_for_messages 等）从 query 读 key，POST 那套 readBody 自愈覆盖不到，这里补一处。
-      if (url.searchParams.has('key')) {
+      // [patch 漏填 key 2026-10-20] 连 `?key` 都没带的情况也要管：v2 路径下按令牌补一个。
+      // 控制台调用不带 x-agent-token，keyFromTokenShaped 会返回 null，不会被误改。
+      if (url.searchParams.has('key') || url.pathname.startsWith('/api/socialV2/')) {
         try {
           const fixedQueryKey = keyFromTokenShaped(url.searchParams.get('key'), req.headers['x-agent-token']);
           if (fixedQueryKey) {
-            log(`[patch key 误填] ${url.pathname} 的 query key 是会话令牌，已按令牌反查为 ${fixedQueryKey}`);
+            const had = String(url.searchParams.get('key') ?? '').trim();
+            log(had
+              ? `[patch key 误填] ${url.pathname} 的 query key 是会话令牌，已按令牌反查为 ${fixedQueryKey}`
+              : `[patch 漏填 key] ${url.pathname} 没带 query key，已按令牌反查为 ${fixedQueryKey}`);
             url.searchParams.set('key', fixedQueryKey);
           }
         } catch { /* 自愈失败不影响主流程 */ }
@@ -2426,6 +2447,21 @@ export function createConsoleServer(S) {
           try { atomicWriteJson(SOCIAL_V2_FILE, { conversations: {} }); } catch (error) { log('重置二代状态：写空状态文件失败:', error?.message ?? error); }
           log('控制台：二代 AI 状态已重置（会话、定时器、唤醒配置已清空，工具日志保留）');
           sendJson({ ok: true });
+          return;
+        }
+        // [patch 漏填 key 2026-10-20] 按令牌反查会话 key —— 模型漏填 key 时的一步到位自救入口。
+        //
+        // 为什么需要单独一个端点：MCP 那侧要先拿到 key 才能拼 URL/body，而「缺 key」在 MCP 的
+        // zod 入口就被毙了，桥接按 body 自愈的补丁根本轮不到。有了它，`qq_send_message({token})`
+        // 这种写法也能一次成功，不用像 2026-10-20 那次一样靠 `const names=[...]` 试 9 次。
+        // 安全性：集中关卡已经要求 x-agent-call 请求必须带活跃令牌；这里再用 keyFromTokenOnly
+        // 保证「令牌 → 唯一会话」，拿 A 的令牌换不出 B 的 key，不构成越权。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/resolve-key') {
+          const token = String(req.headers['x-agent-token'] ?? '');
+          if (!isLiveAgentToken(token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const resolved = keyFromTokenOnly(token);
+          if (!resolved) { sendJson({ ok: false, error: '该令牌对应不到唯一会话，请直接传 key' }, 409); return; }
+          sendJson({ ok: true, key: resolved });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/state') {

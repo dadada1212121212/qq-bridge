@@ -33,6 +33,9 @@ for (const { preset, file, phoneAllowed } of GUARD_CASES) {
     for (const name of PHONE_TOOLS) {
       assert.equal(guard({ name }), undefined, `${preset}: 主人版应放行 ${name}`);
     }
+    // 2026-10-19 PTC：qq-owner 挂 tool-presentation mode:ptc，run_code 是它唯一可用的工具
+    // 入口，按设计对主人放行（严格版仍拒绝，见下方循环的非 PTC 分支）。这里显式钉住「放行」。
+    assert.equal(guard({ name: 'run_code' }), undefined, `${preset}(PTC): 必须放行 run_code（PTC 呈现入口）`);
   } else {
     for (const name of PHONE_TOOLS) {
       assert.equal(typeof guard({ name }), 'string',
@@ -48,6 +51,8 @@ for (const { preset, file, phoneAllowed } of GUARD_CASES) {
   // 不能再丢回那句泛泛的「不在白名单内」——模型会以为是自己名字写错了，换个写法反复重试。
   // 起因是一次真实的 `tool=pwsh` 调用（harness 日志里的审批事件）。
   for (const name of ['pwsh', 'bash', 'read', 'write', 'edit', 'glob', 'grep', 'run_code', 'subagent']) {
+    // qq-owner 挂 PTC，run_code 是设计上放行的入口（上一段已单独钉），这里不再要求拒绝。
+    if (name === 'run_code' && phoneAllowed) continue;
     try {
       const reason = guard({ name });
       assert.equal(typeof reason, 'string', `${preset}: 必须拒绝本机工具 ${name}`);
