@@ -163,6 +163,21 @@ const tests = [
   'test-memory-db.mjs',
   // [省步] 步数提醒阈值与文案。
   'test-step-nudge.mjs',
+  // [表情包] 路由/函数存在性：2026-10-18 拆模块后路由搬到了 console-server，
+  // 只读 bridge.js 的旧写法让 6 条断言假红（已修成同时读两个文件）。
+  'test-stickers.mjs',
+  // [MCP 安全] 工具白名单/参数校验/越权拒绝 —— 安全相关，必须在每次回归里跑。
+  'test-mcp-safe.mjs', 'test-mcp-host.mjs', 'test-mcp-servers-stdio.mjs',
+  // [B 站养鱼] 配额/追更/评论纯逻辑。
+  'test-bilibili-lib.mjs',
+  // [小游戏 / 回合游戏 / 点歌] 纯逻辑 + 端点契约。
+  'test-light-games.mjs', 'test-turn-games.mjs', 'test-music-links.mjs',
+  // [印象 / 情景记忆 / 待办承诺] 记忆链路。
+  'test-impression-profile.mjs', 'test-episodic-memory.mjs', 'test-promises.mjs',
+  // [agent preset 补丁] 生成物与源必须一致（只改源不重生成 = 她收不到，日志里看不出来）。
+  'test-agent-preset-patches.mjs',
+  // [v2 等待] 回合等待/超时的纯逻辑段（真连 DSH 的那半在 test-dsh-v2-wait，不进审计）。
+  'test-v2-wait.mjs',
 ];
 let failed = 0;
 for (const test of tests) {

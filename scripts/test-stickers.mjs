@@ -118,7 +118,10 @@ console.log('## MCP 工具描述存在性');
 
 console.log('## bridge 路由/函数存在性');
 {
-  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  // ⚠️ 2026-10-18 拆模块后，这些路由搬到了 console-server.js（`/api/socialV2/sticker-*`）。
+  // 只读 bridge.js 会让这 6 条断言长期假红 —— 扫源码的测试必须把拆出去的模块一起读。
+  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8')
+    + '\n' + fs.readFileSync(path.join(ROOT, 'src', 'console-server.js'), 'utf8');
   for (const s of ['/api/socialV2/sticker-list', '/api/socialV2/sticker-image', '/api/socialV2/sticker-note', '/api/socialV2/send-sticker', '/api/socialV2/sticker-remark', '/api/stickers', 'syncStickerLibrary', 'sendStickerV2']) {
     ok(bridge.includes(s), `bridge 包含 ${s}`);
   }
