@@ -52,6 +52,7 @@ import { createMemoryDb } from './memory-db.js';
 // 但桥接不该为了一个日期函数去 import 那个会拖 node:sqlite 的模块。
 import { createLongMemory } from './long-memory.js';
 import { createConsoleServer } from './console-server.js';
+import { createFileTransfer } from './file-transfer.js';
 import { createWakePrompt } from './wake-prompt.js';
 import { createSocialState } from './social-state.js';
 import { detectEventFollowUp, HOSTILE_RE, PEACE_RE, milestoneDays, diffBiliFollowsV2, deepseekCostYuan } from './social-mechanisms.js';
@@ -1757,13 +1758,6 @@ async function main() {
       log(`[sticker] 同步收藏表情失败: ${error?.message ?? error}`);
       return null;
     }
-  }
-
-  // 返回给 AI 的表情列表（带本地认知）。
-  async function listStickersForV2(query = '', count = 48, force = false) {
-    const synced = await syncStickerLibrary(force);
-    const entries = synced?.entries ?? stickerEntries;
-    return formatStickerList(entries, query, count);
   }
 
   // 取单个表情的图片字节（多模态用）。
@@ -4666,6 +4660,34 @@ async function main() {
   // [拆分 2026-10-18] 控制台 HTTP 层已移到 src/console-server.js（约 5557 行）。
   // 这里只声明依赖表：函数与 const 直接传引用；可变变量用 getter/setter 保证实时。
   // 必须延迟到调用时求值：依赖里不少 const 声明在本函数之后（TDZ）。
+  // ── 文件收发 ──────────────────────────────────────────────────────────────
+  // 底层能力在 src/file-transfer.js：发送用 OneBot upload_private_file / upload_group_file，
+  // 接收用 onNotice 把文件类事件交给 handleFileNoticeEvent，仅主人私聊处理。
+  const fileTransfer = createFileTransfer({ oneBotCall, cfg, ROOT, STATE_DIR, log });
+  async function handleFileNoticeEvent(event) {
+    if (!event || typeof event !== 'object') return;
+    const t = event.notice_type || '';
+    const looksLikeFile = t === 'offline_file' || t === 'group_upload' || t === 'private_upload' || !!(event.file_id || event.fileId);
+    if (!looksLikeFile) return;
+    const fromKey = event.group_id ? `group:${event.group_id}` : (event.user_id ? `private:${event.user_id}` : '');
+    const ownerKey = `private:${String(cfg.ownerQQ ?? '')}`;
+    if (fromKey !== ownerKey) {
+      log(`[文件] 忽略非主人文件事件 ${t} from ${fromKey}`);
+      return;
+    }
+    try {
+      const res = await fileTransfer.handleFileNotice(event);
+      if (res?.ok) {
+        log(`[文件] 收到主人文件 → ${res.savedPath}`);
+        appendActivity(`收到文件：${res.meta?.name || '未知'}（${res.savedPath}）`);
+      } else {
+        log(`[文件] 收到无法识别的文件事件：${JSON.stringify(res)}`);
+      }
+    } catch (e) {
+      log('[文件] 处理接收失败：', e?.message ?? e);
+    }
+  }
+
   const consoleDeps = () => ({
     ACCOUNT_ACTION_LEVELS,
     ACCOUNT_LEVEL_RANK,
@@ -4989,6 +5011,11 @@ async function main() {
     withTimeout,
     writeRoleContent,
     writeRoleState,
+    sendFile: fileTransfer.sendFile,
+    listInbox: fileTransfer.listInbox,
+    readInbox: fileTransfer.readInboxText,
+    setInboxDir: fileTransfer.setInboxDir,
+    getInboxDir: fileTransfer.getInboxDir,
   });
   const startConsoleServer = () => createConsoleServer(consoleDeps());
 
@@ -9733,6 +9760,7 @@ async function main() {
     moodMemoryLineV2,
     openAsksV2,
     pending,
+    pickSendCountHintV2,
     get pendingBroadcastV2() { return pendingBroadcastV2; }, set pendingBroadcastV2(v) { pendingBroadcastV2 = v; },
     readRoleState,
     relationLineV2,
@@ -12901,6 +12929,10 @@ async function main() {
   bot.onNotice('notify', async (event) => {
     try { await handlePokeNotice(event); } catch (error) { log('处理拍一拍事件出错:', error?.message ?? error); }
   });
+  // 文件收发：监听文件类 notice（QQ 私聊发文件通常是 offline_file）。仅主人私聊处理，群聊一律忽略。
+  bot.onNotice(async (event) => {
+    try { await handleFileNoticeEvent(event); } catch (error) { log('处理文件事件出错:', error?.message ?? error); }
+  });
 
   // ── 上游健康：任何事件包都算「SnowLuma 还活着」，心跳还额外带接收链路健康度 ──
   // 用 onEvent 挂一个**旁路**订阅（不影响主链路）：
@@ -12985,8 +13017,6 @@ async function main() {
    * 只修其中一个的话，桥接仍会以 1006 反复重连（实测踩过）。
    */
   async function applyHealedTokens(r) {
-    const httpToken = r.token;
-    const wsToken = r.wsToken || r.token;
     // ⚠️ 端点跟随是可关的（`snowluma.followDiscoveredEndpoint: false`），默认保持原行为。
     //
     // 为什么需要这个开关：自愈会拿 `discoverSnowLumaConnection()` **发现到的** wsUrl
@@ -12999,6 +13029,14 @@ async function main() {
     //   · 实测踩过：把 wsUrl 指向一个死端口想让它"别连"，启动后仍被改回真实端点并连上。
     // 关掉之后**只自愈 token**（换账号仍然能恢复），但绝不动 URL、也不写回 URL。
     const followEndpoint = cfg.snowluma?.followDiscoveredEndpoint !== false;
+    // [bug 修复] 端点跟随时，discover 到的 token 属于"发现到的那个端点/账号"。
+    // 关掉跟随（指向另一份 SnowLuma / 另一个账号）时若把发现到的 token 硬套到配置端点上，
+    // 就是"用 A 的 token 连 B" —— 必然 401/1006，还会污染 config.json（实测 fish 空转 1.5h）。
+    // 只有「跟随端点」或「发现到的端点与配置端点一致（同一份安装、仅换账号）」才采用发现到的 token。
+    const sameEndpoint = !!r.wsUrl && r.wsUrl === cfg.snowluma.wsUrl;
+    const useDiscoveredToken = followEndpoint || sameEndpoint;
+    const httpToken = useDiscoveredToken ? r.token : cfg.snowluma.accessToken;
+    const wsToken = useDiscoveredToken ? (r.wsToken || r.token) : bot.accessToken;
     const wsUrl = followEndpoint ? (r.wsUrl || cfg.snowluma.wsUrl) : cfg.snowluma.wsUrl;
     const wsChanged = bot.accessToken !== wsToken || bot.url !== wsUrl;
     bot.accessToken = wsToken || undefined;
@@ -13006,7 +13044,7 @@ async function main() {
     // 只换 token 不换 URL 会一直 1006 重连。
     bot.url = wsUrl;
     if (wsChanged) log(`🔄 SnowLuma WS 连接已更新：${wsUrl}（token ${String(wsToken).slice(0, 4)}…）`);
-    if (cfg.snowluma.accessToken !== httpToken) {
+    if (useDiscoveredToken && cfg.snowluma.accessToken !== httpToken) {
       log(`🔄 SnowLuma HTTP token 已更新（来源 ${r.source}）：${String(cfg.snowluma.accessToken).slice(0, 4)}… → ${String(httpToken).slice(0, 4)}…`);
       cfg.snowluma.accessToken = httpToken;
     }
@@ -13019,23 +13057,26 @@ async function main() {
     // 关掉端点跟随时不写 URL：否则"我设了别处"这件事会被自愈持久化地抹掉。
     const previousWsUrl = cfg.snowluma.wsUrl;
     cfg.snowluma.wsUrl = wsUrl;
-    try {
-      const w = persistSnowLumaEndpoint(path.join(ROOT, 'config.json'), {
-        accessToken: httpToken,
-        ...(followEndpoint ? { wsUrl, httpUrl: r.baseUrl } : {})
-      });
-      if (w.updated) log(`   已写回 config.json：${Object.keys(w.changed).join(' / ')}`);
-      else log('   config.json 端点已是最新，无需改写');
-      if (!followEndpoint && previousWsUrl !== wsUrl) cfg.snowluma.wsUrl = previousWsUrl;
-    } catch (error) {
-      log(`   ⚠️ 写回 config.json 失败：${error?.message ?? error}`);
+    // 只有真正采用发现到的 token 时才写回 config.json —— 否则是在把"另一份安装的 token"写进自己的配置。
+    if (useDiscoveredToken) {
+      try {
+        const w = persistSnowLumaEndpoint(path.join(ROOT, 'config.json'), {
+          accessToken: httpToken,
+          ...(followEndpoint ? { wsUrl, httpUrl: r.baseUrl } : {})
+        });
+        if (w.updated) log(`   已写回 config.json：${Object.keys(w.changed).join(' / ')}`);
+        else log('   config.json 端点已是最新，无需改写');
+        if (!followEndpoint && previousWsUrl !== wsUrl) cfg.snowluma.wsUrl = previousWsUrl;
+      } catch (error) {
+        log(`   ⚠️ 写回 config.json 失败：${error?.message ?? error}`);
+      }
     }
     // 更新了就让 SDK 立刻用新参数重连（否则要等下一轮退避，最长要好几秒）
     if (wsChanged) {
       try { bot.close(1000, 'token-refresh'); } catch {}
       try { bot.connect(); } catch {}
     }
-    return wsChanged;
+    return { wsChanged, applied: useDiscoveredToken };
   }
 
   /** 只写文件、不动物件（连接已成功时用）。 */
@@ -13047,6 +13088,7 @@ async function main() {
   }
 
   let tokenHealAt = 0;
+  let lastSkipHealLogAt = 0;
   async function healTokenIfStale(reason) {
     const now = Date.now();
     if (now - tokenHealAt < 10000) return;   // 节流：close 事件会连续触发
@@ -13057,8 +13099,16 @@ async function main() {
         log(`⚠️ token 自愈失败（${reason}）：${r.error}`);
         return;
       }
-      await applyHealedTokens(r);
-      log(`   自愈完成：账号 ${r.self?.user_id ?? '?'}（${reason}）`);
+      const res = await applyHealedTokens(r);
+      if (res.applied) {
+        log(`   自愈完成：账号 ${r.self?.user_id ?? '?'}（${reason}）`);
+      } else if (now - lastSkipHealLogAt > 300000) {
+        // 发现到的是另一份 SnowLuma / 另一个账号：已按 followDiscoveredEndpoint=false 忽略。
+        // 5 分钟内只提示一次，避免 30s 一次的刷屏（端点长期不通时尤其吵）。
+        lastSkipHealLogAt = now;
+        log(`   ⚠️ 跳过自愈：发现到的账号 ${r.self?.user_id ?? '?'}（${r.wsUrl}）与配置端点 ${cfg.snowluma.wsUrl} 不一致；`
+          + 'followDiscoveredEndpoint=false，继续用配置端点。若该端点长期无人监听，请确认对应 QQ 号已在 SnowLuma 登录、OneBot 服务已开启。');
+      }
     } catch (error) {
       log(`⚠️ token 自愈异常：${error?.message ?? error}`);
     }

@@ -86,13 +86,16 @@ check('formatForwardResponse 兼容标准 node.data 结构', fmtNode.messages[0]
 check('nodeText 清洗 CQ 字符串', nodeText({ message: '[CQ:image,file=x]' }) === '[媒体]');
 
 // 4. 配置默认开关
+// ⚠️ 断言的是**出厂默认**（config.example.json）。config.json 是每台机器自己的活文件，
+// 用户完全可能把 getForwardMsg / recommendedPoke 关掉（本机就关了），拿它断言会长期假红。
+// 与 test-peak-quiet 的既有做法一致。
 try {
-  const config = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
+  const config = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.example.json'), 'utf8'));
   check('config.socialV2.tools.getForwardMsg 默认开启', config.socialV2?.tools?.getForwardMsg !== false);
   check('config.socialV2.tools.sendPoke 默认开启', config.socialV2?.tools?.sendPoke !== false);
   check('config.socialV2.wake.recommendedPoke 默认开启', config.socialV2?.wake?.recommendedPoke !== false);
 } catch (error) {
-  check('config.json 可读', false, error?.message);
+  check('config.example.json 可读', false, error?.message);
 }
 
 // 5. 桥接端点安全拒绝（可选，桥接运行且状态存在时）

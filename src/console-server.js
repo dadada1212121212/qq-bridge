@@ -3162,6 +3162,66 @@ export function createConsoleServer(S) {
           }
           return;
         }
+        // ── 文件收发：发送文件（agent 调用）────────────────────────────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-file') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const filePath = String(body.filePath ?? '').trim();
+          const name = body.name ? String(body.name).trim() : undefined;
+          if (!key || !filePath) { sendJson({ ok: false, error: 'key 和 filePath 不能为空' }, 400); return; }
+          if (cfg.socialV2?.files?.enabled === false) { sendJson({ ok: false, error: '文件收发功能已禁用（socialV2.files.enabled=false）' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (S.currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送文件必须携带 agent token' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1]; const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, S.currentMode)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          try {
+            const res = await S.sendFile({ key, filePath, name });
+            sendJson({ ok: true, ...res });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+          }
+          return;
+        }
+        // ── 文件收发：收件箱查询 / 读取（agent 调用）──────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/inbox') {
+          const key = url.searchParams.get('key') || '';
+          const token = req.headers['x-agent-token'] || url.searchParams.get('token') || '';
+          const limit = Number(url.searchParams.get('limit')) || 50;
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          sendJson({ ok: true, ...S.listInbox(limit) });
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/inbox-file') {
+          const key = url.searchParams.get('key') || '';
+          const token = req.headers['x-agent-token'] || url.searchParams.get('token') || '';
+          const seq = url.searchParams.get('seq');
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const r = await S.readInbox(seq);
+          sendJson({ ok: r.ok !== false, ...r });
+          return;
+        }
+        // ── 文件收发：设置收件目录（agent 调用，全局设置）────────────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/set-inbox-dir') {
+          const body = await readBody();
+          const dir = body.dir ? String(body.dir).trim() : '';
+          const key = String(body.key ?? '').trim();
+          if (cfg.socialV2?.files?.enabled === false) { sendJson({ ok: false, error: '文件收发功能已禁用（socialV2.files.enabled=false）' }, 403); return; }
+          if (S.currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式设置收件目录必须携带 agent token' }, 403); return; }
+          if (key && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          try {
+            const res = await S.setInboxDir(dir);
+            sendJson({ ok: true, ...res });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+          }
+          return;
+        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-poke') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();

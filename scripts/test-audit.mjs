@@ -170,6 +170,8 @@ const tests = [
   'test-mcp-safe.mjs', 'test-mcp-host.mjs', 'test-mcp-servers-stdio.mjs',
   // [MCP 安全] 模型漏填 key 时按令牌自愈（2026-10-20 事故回归）。
   'test-mcp-key-selfheal.mjs',
+  // [文件收发] 发送路径转换/大小限制/接收落盘/收件箱读取（2026-10-20 新增）。
+  'test-file-transfer.mjs',
   // [B 站养鱼] 配额/追更/评论纯逻辑。
   'test-bilibili-lib.mjs',
   // [小游戏 / 回合游戏 / 点歌] 纯逻辑 + 端点契约。

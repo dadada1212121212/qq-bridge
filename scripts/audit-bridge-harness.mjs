@@ -43,6 +43,9 @@ import * as jsonFile from '../src/json-file.js';
 import * as dayKey from '../src/day-key.js';
 import * as linkDigest from '../src/link-digest.js';
 import * as silentFailures from '../src/silent-failures.js';
+// 2026-10-20 文件收发：bridge.js 从 file-transfer.js 取 createFileTransfer，
+// 夹具剥掉 import 后必须在这里注入，否则所有走 main() 的回归都 ReferenceError。
+import * as fileTransfer from '../src/file-transfer.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 export async function bridgeHarness({ config = {}, savedState, globals = {} } = {}) {
@@ -200,6 +203,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     ...dayKey,
     ...linkDigest,
     ...silentFailures,
+    ...fileTransfer,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

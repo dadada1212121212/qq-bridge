@@ -698,6 +698,96 @@ server.tool(
   }
 );
 
+// ── 文件收发工具（发送 + 收件箱）─────────────────────────────────────────
+// 接收是事件驱动（桥接 bot.onNotice 监听，仅主人私聊），这里提供发送与查询工具。
+// 全部走 KEY_ARG（漏 key 时按令牌反查），与 qq_send_message 同构。
+if (cfg.socialV2?.tools?.files !== false) {
+  server.tool(
+    'qq_send_file',
+    '发送文件给指定会话（二代仿真模式专用）。支持：① Windows 绝对路径（如 C:/Users/x/报告.txt，桥接会转成 SnowLuma 能读的路径）；② file:// 引用；③ base64: 引用。文件作为 QQ 文件发出去（私聊用 upload_private_file，群聊用 upload_group_file），发送受桥接权限闸门与静默模式限制。注意：网络 URL 暂不支持，先把文件下载到本地再发；不支持相对路径。reserved2 下必须携带会话令牌 token。',
+    {
+      key: KEY_ARG,
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      filePath: z.string().describe('要发送的文件路径：Windows 绝对路径 / file:// 引用 / base64: 引用。不支持网络 URL'),
+      name: z.string().optional().describe('文件在对方 QQ 上显示的名字（可选，缺省用原文件名）')
+    },
+    async ({ key, token, filePath, name }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-file', {
+          method: 'POST',
+          body: JSON.stringify({ key, filePath, name }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发送文件失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_list_inbox',
+    '列出机器人收到的文件（收件箱）。仅主人私聊发的文件会被接收存档。返回最近的文件列表（文件名/大小/接收时间/seq 等）。拿到 seq 后可用 qq_read_inbox_file 读取文本内容。reserved2 下必须携带会话令牌 token。',
+    {
+      key: KEY_ARG,
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      limit: z.number().int().positive().max(200).optional().describe('返回最近多少条（默认 50）')
+    },
+    async ({ key, token, limit }) => {
+      try {
+        const qs = new URLSearchParams({ key, token, ...(limit ? { limit: String(limit) } : {}) }).toString();
+        const data = await agentApi('/api/socialV2/inbox?' + qs, { method: 'GET', headers: { 'x-agent-token': token }, timeoutMs: 30000 });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `查询收件箱失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_read_inbox_file',
+    '读取收件箱里某个文件的文本内容（限文本类，过大或非文本会给出提示）。先用 qq_list_inbox 拿到 seq。仅主人私聊收到的文件可读。reserved2 下必须携带会话令牌 token。',
+    {
+      key: KEY_ARG,
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      seq: z.union([z.number(), z.string()]).describe('文件在收件箱里的 seq（来自 qq_list_inbox）')
+    },
+    async ({ key, token, seq }) => {
+      try {
+        const qs = new URLSearchParams({ key, token, seq: String(seq) }).toString();
+        const data = await agentApi('/api/socialV2/inbox-file?' + qs, { method: 'GET', headers: { 'x-agent-token': token }, timeoutMs: 30000 });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `读取文件失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_set_inbox_dir',
+    '设置机器人“接收文件后保存到哪里”。当用户说“存到某路径”（如“存到 D:/我的文件”）时调用，传入 dir=该 Windows 绝对路径，之后收到的文件就直接存进那个目录（不再按日期分子目录）。传空 dir 或省略则恢复默认收件箱（state/files/inbox，按日期归档）。必须是 Windows 绝对路径，不支持相对/网络路径。reserved2 下必须携带会话令牌 token。',
+    {
+      key: KEY_ARG,
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      dir: z.string().optional().describe('收件目录的 Windows 绝对路径，如 D:/我的文件。传空或省略=恢复默认收件箱')
+    },
+    async ({ key, token, dir }) => {
+      try {
+        const data = await agentApi('/api/socialV2/set-inbox-dir', {
+          method: 'POST',
+          body: JSON.stringify({ key: key || '', dir: dir || '' }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `设置收件目录失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
 if (cfg.socialV2?.tools?.sendPoke !== false) {
   server.tool(
     'qq_send_poke',

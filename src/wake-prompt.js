@@ -57,6 +57,7 @@ export function createWakePrompt(S) {
     moodMemoryLineV2,
     openAsksV2,
     pending,
+    pickSendCountHintV2,
     relationLineV2,
     replyTimingV2,
     reverse,
@@ -339,6 +340,10 @@ export function createWakePrompt(S) {
     // 放 volatileSeg：随新打卡变化，必须每轮重算；瘦身时也保留（很短，但决定她像不像熟人）。
     let moodBoardLine = '';
     try { moodBoardLine = moodBoardLineV2(key); } catch (e) { log('[心情板] 生成失败：' + (e?.message || e)); }
+    // [patch 拟人条数] 把「这轮发几条」按心情+随机的建议接进提示词（见 pickSendCountHintV2，已实现但之前没接线），
+    // 消掉「每轮固定发两条」的机械感。放 volatileSeg：每轮不同，且受 moodPace 影响。
+    let sendCountHintLine = '';
+    try { sendCountHintLine = pickSendCountHintV2(); } catch (e) { log('[条数] 建议生成失败：' + (e?.message || e)); }
     // [patch 分段分组] 把「固定 / 低频 / 每轮变」三类分段分开排。
     //
     // ⚠️ 2026-10-13 实测修正：这里原先写着「分段顺序 = DeepSeek 前缀缓存的命中范围」，
@@ -392,7 +397,7 @@ export function createWakePrompt(S) {
     const slowSeg = moeLine + wakeLine + recapLine + dbLine + diaryLine + styleLine + ironLine;
     const volatileSeg = moodLine + grumpLine + sleepToneLine + spendLine + moodMemoryLine + moodBoardLine + relationLine + askLine + statusLine + usageLine + stickerContextLine
       + memoryLine + participationLine + recallLine + longRecallLine
-      + followUpLine + anniversaryLine + memorySelfCheckLine + coldShoulderLine + replyLine + linkLine;
+      + followUpLine + anniversaryLine + memorySelfCheckLine + coldShoulderLine + replyLine + linkLine + sendCountHintLine;
     // [省token] 瘦身模式：补答回合 / 群聊正热时只留「人设 + 规则 + 台账 + 状态 + 收尾」，
     // 砍掉摘要/回放/动漫库/表情清单/参与感/关系/习惯等段落（实测每轮约 4900 → 2200 字）。
     //
@@ -403,7 +408,7 @@ export function createWakePrompt(S) {
     const slimSeg = standingLine + (lean ? '' : slimStaticSeg) + askLine + grumpLine + moodLine + sleepToneLine + spendLine + moodBoardLine + statusLine + linkLine
       + (slimKeepMemory ? memoryLine : '')
       // [拟人] 瘦身轮也必须带的四件套里的两段：直接决定这轮怎么回人（该问的问、别扭的淡着）。
-      + followUpLine + coldShoulderLine;
+      + followUpLine + coldShoulderLine + sendCountHintLine;
     let base = slim ? slimSeg : (stableSeg + slowSeg + volatileSeg);
     if (slim) log('[省token] ' + key + ' 用瘦提示词（' + base.length + ' 字，原因 ' + reason + '）');
     // [分段成本探针] 打开 QQ_WAKE_COST_LOG=1 时，把每一段的真实字符数写进日志。
