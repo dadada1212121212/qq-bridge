@@ -281,7 +281,9 @@ export const STRICT_ONLY_TOOL_NAMES = Object.freeze([
  */
 export function denyNamesFor({ allowPhoneAdb = false } = {}) {
   return [
-    ...KNOWN_DANGEROUS_GLOBAL_TOOLS,
+    // run_code 只在主人私聊放行（PTC 呈现的唯一入口）：主人版把它从隐藏清单摘掉，
+    // 否则注册期就藏了，presentation 折叠出来的 run_code 直接不可见。
+    ...KNOWN_DANGEROUS_GLOBAL_TOOLS.filter((name) => !(allowPhoneAdb && name === 'run_code')),
     ...HARNESS_ONLY_TOOL_NAMES,
     ...(allowPhoneAdb ? [] : STRICT_ONLY_TOOL_NAMES),
   ]
@@ -374,9 +376,15 @@ const OWNER_EXTRA_PREFIXES = [
  * ⚠️ 安全性同 OWNER_EXTRA_PREFIXES：这是**主人私聊专属**。`phone_lan` 能点击、
  * 输入、发消息、下单，任何群聊成员拿到它都等于拿到主人的手机。所以它只出现在
  * OWNER_* 里，绝不进 SAFE_*。
+ *
+ * run_code（PTC 呈现的统一入口，dsh-ops 提供）也在这里：只在主人私聊放行。
+ * 它能执行模型写的代码 = 完整的本地执行能力，群聊绝不开放；主人私聊开它
+ * 是为了 PTC 模式实测（2026-10-20），配套改动见 build-agent-preset-patches.mjs
+ * 的 qq-owner（tool-presentation mode:ptc + persona 的 run_code 说明）。
  */
 const OWNER_EXTRA_EXACT = [
   'phone_lan',
+  'run_code',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，

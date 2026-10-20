@@ -100,6 +100,19 @@ const PHONE_PREFIX = [
   '- **你没有这些工具**（别绕路、别幻想）：装应用、卸载、改系统设置、清数据、执行任意命令、读本地文件、直接付款。',
 ].join('\n');
 
+// PTC（dsh-ops）只在主人私聊开的说明。为什么要写进 persona：基座（qq-chat-v2）的第 35 条
+// 把 run_code 列进「这些工具不存在，别调」——那段对群聊是对的（安全边界），对主人是反的。
+// 所以 qq-owner 派生时用 prefixRewrites 把 run_code 从禁令里摘掉，再在这里补一句正向说明。
+// 具体调用语法由 DSH 的 tool-presentation 注入（tools:ptc-only 段），这里不重复教、只给口径。
+const PTC_PREFIX = [
+  '【PTC：run_code 只在主人私聊可用】',
+  '- 你可以通过 run_code 写一段 JavaScript 一次完成多步：按顺序调用多个工具、对结果做判断后再调下一个。',
+  '- QQ 工具的名字与参数不变（mcp__snowluma__qq_send_message 这些），只是调用入口变成了 run_code；',
+  '  具体写法以系统提示里 run_code 的说明为准，两种写法（直接调工具 / 写 run_code）都可以用，挑顺手的。',
+  '- 分条、令牌、分寸那些规则一条都没变：该几条还是几条，令牌照传。',
+  '- run_code 是主人才有的能力，在任何群聊里都没有这个工具，也别提它。',
+].join('\n');
+
 const DERIVED_PRESETS_INTERNAL = {
   'qq-owner': {
     from: 'qq-chat-v2',
@@ -111,7 +124,20 @@ const DERIVED_PRESETS_INTERNAL = {
     // 行级覆盖：把守卫换成主人版——同一个 installGuard 实现，多放行 mcp__phone-adb__。
     // ⚠️ 改这一行等于改安全边界：qq-owner 之外任何 preset 都不得引用 qq-tool-restrict-owner.mjs。
     rowPatches: { 'qq-tool-restrict': { name: './qq-tool-restrict-owner.mjs' } },
-    prefixAppend: PHONE_PREFIX,
+    // PTC 呈现（dsh-ops）：把全部工具折叠成一个 run_code 入口，模型写代码批量调用 ——
+    // 少几轮 function-call 往返 = 少几份全价 token。只在主人私聊开（run_code 的守卫豁免
+    // 只在 qq-tool-restrict-owner.mjs 的 OWNER_EXTRA_EXACT 里）。
+    rowsAppend: [{
+      id: 'tool-presentation',
+      name: '@deepseek-ai/dsh-agent-tool-presentation',
+      config: { mode: 'ptc' },
+    }],
+    // 基座第 35 条把 run_code 列进「别调」清单（对群聊是对的）；主人版摘掉它。
+    prefixRewrites: [
+      ['宿主联网搜索（web_search、web_fetch、read_page、advanced_search、multi_search 等）、跑代码（run_code）、',
+       '宿主联网搜索（web_search、web_fetch、read_page、advanced_search、multi_search 等）、'],
+    ],
+    prefixAppend: `${PHONE_PREFIX}\n\n${PTC_PREFIX}`,
   },
   'qq-chat-v2-fish': {
     from: 'qq-chat-v2',
@@ -156,6 +182,7 @@ function derivedPrefixAppend(derived, name) {
 function derivedSummary(derived) {
   const parts = [];
   if (derived.rowPatches && Object.keys(derived.rowPatches).length > 0) parts.push('行级覆盖');
+  if (derived.rowsAppend?.length) parts.push(`追加插件行（${derived.rowsAppend.map((r) => r.id).join(' ')}）`);
   if (derived.prefixRewrites?.length) parts.push('persona 工具名改写');
   if (derived.prefixAppend || derived.prefixAppendFrom) parts.push('persona 追加');
   return parts.length > 0 ? parts.join(' + ') : '无差异';
@@ -176,6 +203,8 @@ export const DERIVED_PRESET_INFO = Object.freeze(Object.fromEntries(
     prefixAppend: d.prefixAppend,
     /** 实际追加到 persona 末尾的正文（prefixAppendFrom 时是从文件读来的那份）。 */
     prefixAppendText: derivedPrefixAppend(d, name),
+    /** 派生时追加到插件清单末尾的行 id（如 qq-owner 的 PTC 呈现）。 */
+    rowsAppendIds: Object.freeze((d.rowsAppend ?? []).map((r) => r.id)),
     /** [[旧工具名前缀, 新工具名前缀], …]，按数组顺序做字面替换。 */
     prefixRewrites: Object.freeze(d.prefixRewrites ?? []),
   })])));
@@ -206,7 +235,9 @@ function applyDerived(rows, derived, name) {
     }
     return next;
   });
-  return walk(rows, name);
+  // rowsAppend：给派生 preset 追加基座没有的插件行（如 qq-owner 的 PTC 呈现）。
+  // 只追加、不递归——追加行都是自带 config 的叶子行。
+  return [...walk(rows, name), ...(derived.rowsAppend ?? [])];
 }
 
 export const BUNDLE_DIR = path.join(REPO_ROOT, 'plugins', 'qq-agent-presets');

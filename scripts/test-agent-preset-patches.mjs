@@ -75,11 +75,19 @@ for (const name of PRESETS) {
     // （可选）persona 里的工具名改写。用「除这些外全部深相等」表达，
     // 比在测试里重算一遍派生结果更抗改。
     const patchRows = row.config.plugins;
-    ok(patchRows.map((r) => r.id).join(',') === source.map((r) => r.id).join(','),
-      `${name}: 行 id 与基座 ${baseName} 完全一致且同序（${patchRows.length} 行）`);
+    const appended = derived.rowsAppendIds ?? [];
+    const baseRows = patchRows.slice(0, patchRows.length - appended.length);
+    // 派生允许在基座行**末尾追加**新插件行（如 qq-owner 的 PTC 呈现），但基座行
+    // 本身必须保持原序 —— 追加行只准加在尾部，不准插进中间或替换语义。
+    ok(baseRows.map((r) => r.id).join(',') === source.map((r) => r.id).join(','),
+      `${name}: 基座行与 ${baseName} 完全一致且同序，追加行只在末尾（${baseRows.length}+${appended.length} 行）`);
+    if (appended.length > 0) {
+      ok(patchRows.slice(-appended.length).map((r) => r.id).join(',') === appended.join(','),
+        `${name}: 追加的插件行 id 顺序与声明一致（${appended.join(' ')}）`);
+    }
 
     const changed = [];
-    for (const r of patchRows) {
+    for (const r of baseRows) {
       if (r.id === 'persona' || r.id === 'qq-tool-restrict') continue;
       const b = source.find((x) => x.id === r.id);
       if (JSON.stringify(b) !== JSON.stringify(r)) changed.push(r.id);
@@ -97,9 +105,11 @@ for (const name of PRESETS) {
     for (const [from, to] of derived.prefixRewrites) expectedPrefix = expectedPrefix.split(from).join(to);
     ok(derivedPrefix.startsWith(expectedPrefix),
       `${name}: persona 前缀完整继承基座（${basePrefix.length} 字符，未截断${derived.prefixRewrites.length ? '；工具名按 prefixRewrites 改写' : ''}）`);
-    if (derived.prefixRewrites.length > 0) {
+    if (derived.prefixRewrites.length > 0 && derived.prefixRewrites.some(([from]) => from.includes('snowluma'))) {
       // 第二个 QQ 号的工具名必须**全部**换掉。留一个 mcp__snowluma__ 她就会照着提示词
       // 去调**另一个账号**的 MCP（两套 MCP 在同一个 profile 里都注册着）。
+      // 只对「真的在改写 snowluma 名字」的派生生效：qq-owner 的 rewrites 是摘 run_code
+      // 禁令，它的 persona 里出现 mcp__snowluma__ 是正常的（它用的就是老号 MCP）。
       const stale = ['mcp__snowluma__', 'mcp__snowluma-host__'].filter((needle) => derivedPrefix.includes(needle));
       ok(stale.length === 0,
         `${name}: persona 前缀里不再出现老号那套工具名${stale.length ? `；残留：${stale.join(', ')}` : ''}`);
