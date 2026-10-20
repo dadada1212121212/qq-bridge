@@ -1,30 +1,62 @@
 // Exercise MCP callbacks with a fake transport: no network, config or stdio server.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 import { z } from 'zod';
-import { searchWeb, renderSearchResult, SearchCache, SOURCE_TIMEOUT_MS } from '../src/web-search-lib.js';
+import {
+  searchWeb, renderSearchResult, SearchCache, SOURCE_TIMEOUT_MS,
+  SEARCH_ENGINES, SEARCH_ENGINES_EXTRA, PROBE_ENGINE_DEFS,
+  setSourceHealth, ttlForQuery, queryTokens, sanitizeQuery, smartTruncate, TTL_FAST_MS,
+} from '../src/web-search-lib.js';
+import { createDiskCache, createSourceHealth, createStats, createCardLog } from '../src/search-store.js';
+import { htmlToText } from '../src/link-digest.js';
+
+// ⚠️ 跨行 import 必须也能剥：mcp-web-search-safe.js 里 `import {` 开头的那一段
+// 不以 `;` 结尾，只按 `^import .*;` 匹配会整段漏掉，vm 里直接
+// `Cannot use import statement outside a module` —— 用例全挂，审计形同虚设。
+const STRIP_IMPORTS_RE = /^import[\s\S]*?from\s+['"][^'"]+['"];?[ \t]*\r?\n/gm;
 
 function loadWebTools(safeFetch) {
   const tools = new Map();
+  // 磁盘层要落盘：给夹具一个临时目录，别把 state/search-*.json 写进真实仓库。
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-web-search-audit-'));
+  fs.mkdirSync(path.join(fixtureRoot, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(fixtureRoot, 'state'), { recursive: true });
+  // 预置一份「刚探过、都没通过」的探测缓存：出口探测就不会在加载时用 safeFetch
+  // 打「测试」探针，calls[0] 才稳定是真正的搜索请求（否则断言会拿到探针 URL）。
+  fs.writeFileSync(
+    path.join(fixtureRoot, 'state', 'search-sources.json'),
+    JSON.stringify({ v: 1, engines: {}, probe: { at: Date.now(), ok: {} } }),
+  );
+  const fixtureUrl = pathToFileURL(path.join(fixtureRoot, 'src', 'mcp-web-search-safe.js')).href;
   const source = fs.readFileSync(new URL('../src/mcp-web-search-safe.js', import.meta.url), 'utf8')
-    .replace(/^import .*;\r?\n/gm, '')
+    .replace(STRIP_IMPORTS_RE, '')
+    // vm 里没有 import.meta，换成一个真实存在的临时文件 URL（状态目录跟着走）。
+    .replace(/import\.meta\.url/g, JSON.stringify(fixtureUrl))
     .replace('await server.connect(new StdioServerTransport());', 'server.connect(new StdioServerTransport());');
   class McpServer {
     tool(name, description, schema, callback) { tools.set(name, { schema, callback }); }
     connect() {}
   }
-  // web_search 的实现依赖 web-search-lib 的这几个导出 —— VM 里必须注入，
-  // 否则 ReferenceError（这两行与 mcp-web-search-safe.js 的 import 保持一致）。
+  // web_search 的实现依赖 web-search-lib / search-store / link-digest 的这些导出 ——
+  // VM 里必须逐个注入，否则 ReferenceError（清单与 mcp-web-search-safe.js 的 import 保持一致）。
   vm.runInNewContext(source, {
     safeFetch, McpServer, StdioServerTransport: class {}, z, URL,
     // anysearch 直连 JSON API，不走 safeFetch；测试里必须把它也钉死，
     // 否则这些用例会偷偷打真网络（慢，而且结果随线上变化，断言就不稳了）。
     fetch: async () => { throw new Error('fixture: no network in tests'); },
     AbortController, setTimeout, clearTimeout,
-    searchWeb, renderSearchResult, SearchCache, SOURCE_TIMEOUT_MS
+    // 退出钩子只登记不执行（别让夹具往测试进程挂 exit 监听）。
+    process: { on() {}, exit() {}, env: process.env },
+    console, path, fileURLToPath,
+    searchWeb, renderSearchResult, SearchCache, SOURCE_TIMEOUT_MS,
+    SEARCH_ENGINES, SEARCH_ENGINES_EXTRA, PROBE_ENGINE_DEFS,
+    setSourceHealth, ttlForQuery, queryTokens, sanitizeQuery, smartTruncate, TTL_FAST_MS,
+    createDiskCache, createSourceHealth, createStats, createCardLog, htmlToText,
   });
   return async (name, arguments_) => {
     const tool = tools.get(name);
@@ -53,6 +85,24 @@ test('MCP search uses bounded shared safeFetch after query sanitization', async 
   // 提速断言：每源请求带独立短超时（不再是 20s 默认）。
   assert.equal(typeof calls[0].opts?.timeoutMs, 'number');
   assert.ok(calls[0].opts.timeoutMs > 0 && calls[0].opts.timeoutMs <= SOURCE_TIMEOUT_MS);
+});
+
+test('web_fetch returns plain text and only blames JS when the page really is a shell', async () => {
+  // 短小但完整的页面：正文两百来字，不能因为"短"就说抓不到正文（否则模型会丢下正文去搜）。
+  const completeHtml = '<!doctype html><html><head><title>t</title><style>body{color:#333}</style></head>'
+    + `<body><div><p>${'This domain is for use in documentation examples. '.repeat(5)}</p></div></body></html>`;
+  let callTool = loadWebTools(async () => ({ statusCode: 200, body: completeHtml, url: 'https://fixture.test/' }));
+  const okText = (await callTool('web_fetch', { url: 'https://fixture.test/' })).content[0].text;
+  assert.doesNotMatch(okText, /JS 渲染/, '正文完整时不许说抓不到正文');
+  assert.match(okText, /documentation examples/);
+  assert.doesNotMatch(okText, /<p>|<style>/, '不许把原始 HTML 标签塞给模型');
+
+  // 纯 JS 渲染的空壳：原始 HTML 很大、转出来只剩导航几十字 → 必须明说，别让她对着菜单硬编。
+  const shellHtml = `<!doctype html><html><head>${'<script>var a=1;</script>'.repeat(300)}</head>`
+    + '<body><div id="app"></div><p>首页 番剧 直播</p></body></html>';
+  callTool = loadWebTools(async () => ({ statusCode: 200, body: shellHtml, url: 'https://fixture.test/app' }));
+  const shellText = (await callTool('web_fetch', { url: 'https://fixture.test/app' })).content[0].text;
+  assert.match(shellText, /JS 渲染/);
 });
 
 test('MCP fetch uses shared transport and exposes rejection as a tool error', async () => {

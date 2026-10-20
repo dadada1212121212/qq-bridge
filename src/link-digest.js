@@ -38,6 +38,8 @@ export function htmlToText(html) {
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
     .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
+    // 截断可能停在半个标签中间（`<a class="chan…`），把尾巴上这个残缺标签也去掉。
+    .replace(/<[^>]*$/, ' ')
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')

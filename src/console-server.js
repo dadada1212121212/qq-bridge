@@ -2042,7 +2042,9 @@ export function createConsoleServer(S) {
           const readJson = (name, fallback) => {
             try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'state', name), 'utf8')); } catch { return fallback; }
           };
-          const todayKey = new Date().toISOString().slice(0, 10);
+          // 本地日期（不是 UTC）：搜索统计按本地日切，用 UTC 的话北京时间 0~8 点会显示"昨天"。
+          const nowD = new Date();
+          const todayKey = `${nowD.getFullYear()}-${String(nowD.getMonth() + 1).padStart(2, '0')}-${String(nowD.getDate()).padStart(2, '0')}`;
           const statsFile = readJson('search-stats.json', { days: {} });
           const raw = statsFile?.days?.[todayKey] || {};
           const num = (v) => Number(v) || 0;

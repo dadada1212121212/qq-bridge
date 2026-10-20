@@ -9220,7 +9220,9 @@ async function main() {
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
     // [链接顺手读] 消息里带 URL 就后台抓一份摘要（不 await，绝不拖慢入库）。
-    try { noteLinksV2(key, msg.plain || msg.text || ''); } catch { /* 抓不到就算了 */ }
+    // ⚠️ 用未截断的 plainContent，别用 msg.plain：后者被 truncateText 砍到 200 字，
+    // 长消息尾部的 URL 会被截半截，抓的是一个不存在的地址。
+    try { noteLinksV2(key, plainContent ?? textContent ?? ''); } catch { /* 抓不到就算了 */ }
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -10866,13 +10868,15 @@ async function main() {
       try { c = JSON.parse(line); } catch { continue; }
       const at = Number(c?.at) || 0;
       if (!at || at <= since) continue;
-      if (at > newest) newest = at;
-      if (added >= SEARCH_CARD_PER_RUN_V2) continue;
+      // ⚠️ 到上限必须 break，不能 continue：continue 会继续往下走并推进游标，
+      // 被跳过的卡片下次就永远取不到了（游标已经越过它们）。
+      if (added >= SEARCH_CARD_PER_RUN_V2) break;
       const q = String(c.query || '').trim().slice(0, 40);
       const sum = String(c.summary || '').replace(/\s+/g, ' ').trim().slice(0, 70);
-      if (!q || !sum) continue;
+      if (!q || !sum) { newest = Math.max(newest, at); continue; } // 无效卡片：游标可以推进
+      let id = null;
       try {
-        mdb.recordFact({
+        id = mdb.recordFact({
           scope: 'global',
           subject: `搜索:${q}`,
           text: `查过「${q}」：${sum}`,
@@ -10880,8 +10884,11 @@ async function main() {
           source: 'search',
           onlyIfNew: true
         });
-        added += 1;
-      } catch { /* 记忆写失败不影响主链路 */ }
+      } catch { id = null; }
+      // 写库失败就别推游标（下次重试这张卡），否则这条记录直接消失。
+      if (!id) continue;
+      added += 1;
+      newest = Math.max(newest, at);
     }
     if (newest > since) {
       st.lastSearchCardAt = newest;

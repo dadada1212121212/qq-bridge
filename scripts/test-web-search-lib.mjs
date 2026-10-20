@@ -498,6 +498,10 @@ eq('缓存上限 200', CACHE_MAX_ENTRIES, 200);
   ok('切点在句子边界（不会切半个字）', /[。\n]$/.test(lt.text.slice(0, lt.text.indexOf('\n…（中间省略'))));
   const resumed = smartTruncate(longText.slice(lt.nextOffset), 2000, lt.nextOffset);
   ok('从 offset 续读能拿到后面的内容', resumed.text.trimStart().startsWith('第') && resumed.text.includes('段'));
+  // 回归钉：续读位置必须是"被省略的中间段"开头，不能是已经展示过的尾部
+  const markerOffset = Number((lt.text.match(/offset=(\d+)/) || [])[1]);
+  eq('续读 offset 与正文里标注的一致', lt.nextOffset, markerOffset);
+  ok('续读位置在尾部之前（不会重复已展示的尾巴）', lt.nextOffset < longText.length - 500);
 
   // 源健康度播种：跨重启的冷却要进进程内冷却表
   resetSourceCooldowns();
@@ -530,6 +534,11 @@ eq('缓存上限 200', CACHE_MAX_ENTRIES, 200);
 
   const rendered = renderSearchResult({ query: 'q', source: 's', results: [{ title: 'T', snippet: 'S', date: '2023-05-12' }] }, { max: 3 });
   ok('结果里带日期', rendered.includes('（2023-05-12）'));
+  // 抖音/头条的摘要自带相对时间（"5个月前"），别再补一个括号：重复占 token 还显得啰嗦。
+  const dup1 = renderSearchResult({ query: 'q', source: 's', results: [{ title: 'T 抖音 5个月前', snippet: 'S', date: '5个月前' }] });
+  ok('摘要已有该时间就不重复标注', !dup1.includes('（5个月前）') && dup1.includes('5个月前'));
+  const dup2 = renderSearchResult({ query: 'q', source: 's', results: [{ title: 'T', snippet: '发布于 5个月前', date: '5个月前' }] });
+  ok('摘要里有时也不重复标注', !dup2.includes('（5个月前）'));
   const stale = renderSearchResult({ query: 'q', source: 's', results: [{ title: 'T' }], staleHint: '这批结果都比较旧' });
   ok('旧结果警告会显示', stale.includes('这批结果都比较旧'));
   ok('没有警告时不多一个字', !renderSearchResult({ query: 'q', source: 's', results: [{ title: 'T' }] }).includes('⚠'));

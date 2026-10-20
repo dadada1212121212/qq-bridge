@@ -30,6 +30,7 @@ import {
   TTL_FAST_MS
 } from './web-search-lib.js';
 import { createDiskCache, createSourceHealth, createStats, createCardLog } from './search-store.js';
+import { htmlToText } from './link-digest.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -257,24 +258,56 @@ server.tool(
     // [2026-10-20] 硬截断改成智能截断：保头 68% + 保尾 32%，切点落在句子边界；
     // 中间省略的部分给 offset，想读就续读，不再"答案在尾部却永远看不到"。
     const FETCH_CHARS = 8000;
-    const from = Math.max(0, Math.min(Number(offset) || 0, 200000));
-    // 多要一点余量：safeFetch 按字符截断，留 3000 给截断标记和边界调整。
-    const want = Math.min(from + FETCH_CHARS + 3000, 60000);
+    // ⚠️ 单次最多从正文第 52000 字往后读：再往后要下载十几万字才够，不值当。
+    // 原来是「from 夹到 200000、下载量夹到 60000」——两个上限不一致，offset 一大就
+    // 必然拿到空串，然后对用户说"已经到正文末尾了"（其实是被自己的上限截住了）。
+    const MAX_READ_CHARS = 52000;
+    const asked = Math.max(0, Number(offset) || 0);
+    if (asked > MAX_READ_CHARS) {
+      return {
+        content: [{
+          type: 'text',
+          text: `这一页太长了：单次最多只能从第 ${MAX_READ_CHARS} 字往后读（你要的是第 ${asked} 字）。换成更具体的来源，或者用 web_search 拿摘要。`
+        }]
+      };
+    }
+    const from = asked;
+    // HTML 页面里标签/脚本占比很高（B 站首页 11000 字原始 HTML 只能换出几百字正文），
+    // 所以按 3 倍抓原始内容，才够换出 8000 字正文。上限 20 万字，别把进程拖死。
+    const want = Math.min((from + FETCH_CHARS + 3000) * 3, 200000);
     try {
       stats.bump('fetches');
       const result = await safeFetch(url, want);
-      const body = typeof result?.body === 'string' ? result.body : '';
+      const rawBody = typeof result?.body === 'string' ? result.body : '';
+      // ⚠️ 2026-10-20 修：这个工具一直号称"返回纯文本"，实际把**原始 HTML** 直接塞给模型。
+      // 实测 B 站首页前 8000 字全是 <head>/<script>，正文一个字都没有 ——
+      // 也就是说 8000 字预算基本全浪费在标签上，"抓正文"这个功能等于没生效。
+      // 现在先判是不是 HTML，是就转纯文本；转完太短（纯 JS 渲染的空壳）才退回原始内容。
+      const looksHtml = /^\s*(?:<!doctype|<html)|<body[\s>]|<div[\s>]|<p[\s>]|<article[\s>]/i.test(rawBody.slice(0, 2000));
+      // 不做"转完太短就退回原始 HTML"那种兜底：8000 字标签对模型毫无价值，
+      // 不如老实给几百字正文 + 一句"这页靠 JS 渲染"。
+      const body = looksHtml ? htmlToText(rawBody) : rawBody;
       const slice = body.slice(from);
       const head = `【HTTP ${result?.statusCode ?? '?'}】${result?.url ?? url}${from > 0 ? `（从第 ${from} 字开始）` : ''}`;
       if (!slice.trim()) {
         return {
-          content: [{ type: 'text', text: `${head}\n（已经到正文末尾了：共 ${body.length} 字${result?.truncated ? '，源站响应过长已按上限截断' : ''}）` }]
+          content: [{
+            type: 'text',
+            text: `${head}\n（这里已经没内容了：读到第 ${body.length} 字${result?.truncated ? '，源站响应过长已按上限截断' : ''}）`
+          }]
         };
       }
       const tr = smartTruncate(slice, FETCH_CHARS, from);
-      const tail = tr.truncated
-        ? `\n…（正文共 ${body.length} 字${result?.truncated ? '，源站响应过长已按上限截断' : ''}；想看后面用 offset=${tr.nextOffset}）`
-        : (result?.truncated ? '\n…（源站响应过长，已按安全上限截断）' : '');
+      // 页面是纯 JS 渲染时，转出来的正文只有导航栏几十个字 —— 直说，别让她对着几行菜单硬编。
+      // ⚠️ 判据不能只看"短"：example.com 全文就 235 字但内容完整，说它"抓不到正文"是撒谎，
+      // 模型会因此丢下手里的正文改去搜。加一条"原始 HTML 比正文大 8 倍以上"（标签/脚本占绝对多数）。
+      const jsOnly = looksHtml && body.trim().length < 300 && rawBody.length > body.length * 8;
+      // 续读入口要一直给：智能截断时指向被省略的中间段；被安全上限截断时指向读到的末尾。
+      const tail = jsOnly
+        ? '\n…（这页主要靠 JS 渲染，抓不到正文。换更具体的来源，或者用 web_search 拿摘要）'
+        : (tr.truncated
+          ? `\n…（${result?.truncated ? '至少 ' : '正文共 '}${body.length} 字；中间省略的部分用 offset=${tr.nextOffset} 续读）`
+          : (result?.truncated ? `\n…（只读到第 ${body.length} 字，后面还有；继续读用 offset=${body.length}）` : ''));
       return { content: [{ type: 'text', text: `${head}\n${tr.text}${tail}` }] };
     } catch (error) {
       stats.bump('fetchFails');

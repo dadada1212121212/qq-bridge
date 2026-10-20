@@ -400,7 +400,7 @@ export function createWakePrompt(S) {
     // 你记着的事 / 对群友的印象】—— 一共 ≈650 字，砍掉换来的钱很少，但她在群里会当场
     // 变成记不住人的陌生人。回放/关系/口癖/动漫库/表情清单/参与感/用量/账号仍然照砍。
     const slimKeepMemory = asksCfgV2().slimKeepMemory !== false;
-    const slimSeg = standingLine + (lean ? '' : slimStaticSeg) + askLine + grumpLine + moodLine + sleepToneLine + spendLine + moodBoardLine + statusLine
+    const slimSeg = standingLine + (lean ? '' : slimStaticSeg) + askLine + grumpLine + moodLine + sleepToneLine + spendLine + moodBoardLine + statusLine + linkLine
       + (slimKeepMemory ? memoryLine : '')
       // [拟人] 瘦身轮也必须带的四件套里的两段：直接决定这轮怎么回人（该问的问、别扭的淡着）。
       + followUpLine + coldShoulderLine;

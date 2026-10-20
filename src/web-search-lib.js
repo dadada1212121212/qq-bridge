@@ -582,7 +582,9 @@ export function smartTruncate(text, maxChars = 8000, baseOffset = 0) {
   return {
     text: s.slice(0, headEnd) + marker + s.slice(tailStart),
     truncated: true,
-    nextOffset: base + tailStart,
+    // 续读位置要给"被省略的中间段"的开头（base+headEnd），不能给尾部开头 ——
+    // 尾部已经展示过了，再让人从 tailStart 读只会重复一遍，中间那段永远读不到。
+    nextOffset: base + headEnd,
     total: s.length
   };
 }
@@ -1070,8 +1072,12 @@ export function renderSearchResult(payload, opts = {}) {
   const head = `${payload.query}（来自 ${payload.source}${payload.cached ? '，缓存' : ''}）`;
   const lines = list.map((r, i) => {
     const sn = String(r.snippet || '').slice(0, 90);
-    const dt = r.date ? `（${r.date}）` : '';
-    return `${i + 1}. ${r.title}${dt}${sn ? ` — ${sn}` : ''}`;
+    const title = String(r.title || '');
+    // 标题/摘要里本来就有这个时间（"5个月前"），别在标题后再补一个括号：
+    // 抖音/头条的摘要自带相对时间，重复一次既占 token 又显得啰嗦。
+    const dupDate = r.date && (title.includes(r.date) || sn.includes(r.date));
+    const dt = r.date && !dupDate ? `（${r.date}）` : '';
+    return `${i + 1}. ${title}${dt}${sn ? ` — ${sn}` : ''}`;
   });
   const stale = payload?.staleHint ? `\n⚠ ${payload.staleHint}` : '';
   const note = payload?.note ? `\n⚠ ${payload.note}` : '';

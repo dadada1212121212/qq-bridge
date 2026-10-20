@@ -141,7 +141,9 @@ console.log('## 唤醒闸门接线');
   ok(/peakResume: 25/.test(wp), 'WAKE_PRIORITY 登记了 peakResume（否则补唤醒优先级算成 0）');
 
   const ingestAt = bridgeSrc.indexOf('const reason = evaluateWakeTriggerV2(');
-  const ingest = ingestAt > 0 ? bridgeSrc.slice(ingestAt, ingestAt + 1400) : '';
+  // 窗口给足 3000：从入站判定到 resumeAfter 门禁实测已经 1390+ 字符，
+  // 1400 的窗口只把目标串露 7 个字符 ⇒ 这条断言长期假红（代码是对的）。
+  const ingest = ingestAt > 0 ? bridgeSrc.slice(ingestAt, ingestAt + 3000) : '';
   ok(/const peakWin = peakQuietAppliesV2\(key\);/.test(ingest), '入站消息先判高峰');
   ok(/高峰绝对静默（\$\{peakWin\.from\}/.test(ingest), '入站高峰时记「只入库不唤醒」');
   ok(/String\(reason\)\.split\(':'\)\[0\] === 'atMention'/.test(ingest), '只有被 @ 才触发罐头道歉（别人说话一律不理）');
@@ -243,21 +245,24 @@ console.log('## 护栏接线（三个文本出口）');
 // ── ⑤ 配置默认值（用户拍板的四件事）─────────────────────────────────────────
 console.log('## 配置默认值');
 {
-  const pq = cfg.socialV2?.peakQuiet ?? {};
-  ok(pq.enabled !== false, 'config.json：peakQuiet 默认开');
-  ok(pq.scope === 'groups', 'config.json：默认只管群（主人私聊任何时候都能说话）');
-  ok(pq.timeZone === 'Asia/Shanghai', 'config.json：按北京时间判高峰');
+  // ⚠️ 断言的是**出厂默认**（config.example.json）。config.json 是每台机器自己的活文件，
+  // 主人完全可能按需要把它关掉（本机就关着 peakQuiet）——拿它当"默认值"断言会长期假红，
+  // 真正的回归反而被这条噪音盖住。
+  const pq = example.socialV2?.peakQuiet ?? {};
+  ok(pq.enabled !== false, 'config.example.json：peakQuiet 默认开');
+  ok(pq.scope === 'groups', 'config.example.json：默认只管群（主人私聊任何时候都能说话）');
+  ok(pq.timeZone === 'Asia/Shanghai', 'config.example.json：按北京时间判高峰');
   ok(Array.isArray(pq.windows) && pq.windows.length === 2
     && String(pq.windows[0]?.[0]) === '09:00' && String(pq.windows[0]?.[1]) === '12:00'
     && String(pq.windows[1]?.[0]) === '14:00' && String(pq.windows[1]?.[1]) === '18:00',
-    'config.json：窗口 = 工作日 9–12 / 14–18（DeepSeek 官方峰谷定价）');
-  ok(pq.weekdaysOnly !== false, 'config.json：只工作日静默（周末按空闲价）');
-  ok(Array.isArray(pq.holidays) && pq.holidays.length === 0, 'config.json：节假日表留空（没瞎填，主人可自己补）');
+    'config.example.json：窗口 = 工作日 9–12 / 14–18（DeepSeek 官方峰谷定价）');
+  ok(pq.weekdaysOnly !== false, 'config.example.json：只工作日静默（周末按空闲价）');
+  ok(Array.isArray(pq.holidays) && pq.holidays.length === 0, 'config.example.json：节假日表留空（没瞎填，主人可自己补）');
   ok(Array.isArray(pq.apologyOn) && pq.apologyOn.length === 0,
-    'config.json：高峰期一条道歉都不发（apologyOn 空 = 绝对静默）');
-  ok(pq.resumeAfter === false, 'config.json：resumeAfter=false —— 高峰消息不排队、不补做（用户 m03167）');
-  ok(typeof pq.apology === 'string' && pq.apology.includes('{name}'), 'config.json：道歉文本带 {name} 占位');
-  ok(Number(pq.apologyMinGapMs) > 0, 'config.json：道歉有最小间隔（防刷屏）');
+    'config.example.json：高峰期一条道歉都不发（apologyOn 空 = 绝对静默）');
+  ok(pq.resumeAfter === false, 'config.example.json：resumeAfter=false —— 高峰消息不排队、不补做（用户 m03167）');
+  ok(typeof pq.apology === 'string' && pq.apology.includes('{name}'), 'config.example.json：道歉文本带 {name} 占位');
+  ok(Number(pq.apologyMinGapMs) > 0, 'config.example.json：道歉有最小间隔（防刷屏）');
 
   const gs = cfg.socialV2?.groupSafety ?? {};
   ok(gs.blockErrorText !== false, 'config.json：群聊报错护栏默认开');

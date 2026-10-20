@@ -79,6 +79,10 @@ eq('原子写能读回来', readJsonSafe(f('w.json'), null), { hello: 1 });
   h.record('fresh', false);
   eq('样本不足的源不跳过', h.cooldownMap().has('fresh'), false);
 
+  // 回归钉：失败太久（3 天没新样本）必须放它回来试一次，否则网络恢复后这个源永远回不来
+  clock += 4 * 86400000;
+  eq('失败 3 天后不再跳过（给它一次恢复机会）', h.cooldownMap().has('dead'), false);
+
   // 显式冷却
   h.markCooldown('bing', clock + 30_000);
   ok('显式冷却立刻生效', h.cooldownMap().has('bing'));

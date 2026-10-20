@@ -74,7 +74,9 @@ const d3 = makeConf({ socialV2: { thinkingFiller: { afterMs: 10 } } }, DEF);
 ok(d3.afterMs === 3000, '阈值有下限 3 秒，避免刚开回合就垫');
 
 console.log('## 接线');
-ok(/frame\.event\.type === 'turn\/start'[\s\S]{0,400}armThinkingFillerV2\(key, frame\.sessionId/.test(bridgeSrc), 'turn/start 时按会话挂定时器');
+// 窗口不能太窄：省步计数那行加进来后，turn/start 到挂定时器的间距已经 460+ 字符，
+// 400 的窗口会让这条断言长期假红（代码其实是对的）。
+ok(/frame\.event\.type === 'turn\/start'[\s\S]{0,1200}armThinkingFillerV2\(key, frame\.sessionId/.test(bridgeSrc), 'turn/start 时按会话挂定时器');
 ok(/v2TurnStartAt\.delete\(frame\.sessionId\);\n\s*clearThinkingFillerV2\(frame\.sessionId\);/.test(bridgeSrc), '回合结束时清掉定时器（主回合与第二槽位都要清）');
 ok((bridgeSrc.match(/clearThinkingFillerV2\(frame\.sessionId\);/g) || []).length >= 2, '主回合 + 第二槽位都有清理');
 ok(/sendToQQ\(key, fillerText\);/.test(bridgeSrc), '垫场话走统一的 QQ 发送通道');

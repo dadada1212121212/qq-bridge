@@ -179,10 +179,15 @@ export function createSourceHealth({
         const fail = Number(s.fail) || 0;
         const total = ok + fail;
         const lastOk = Number(s.lastOkAt) || 0;
+        const lastFail = Number(s.lastFailAt) || 0;
         // 从来没成功过（lastOk=0）也算"3 天内没成功过"，否则全新部署里一个从没通过的源
         // 要等三天才会被跳过 —— 这三天每次搜索都白等它超时。
         const noRecentOk = !lastOk || (t - lastOk > 3 * 86400000);
-        if (total >= minSamples && ok / total < minRate && noRecentOk) {
+        // ⚠️ 必须要求"最近还在失败"：只按累计成功率判死会让一个早就挂掉的源**永远**进不来 ——
+        // 跳过之后不会再有新样本，成功率永远停在低位，等于把这个源永久拉黑（网络好了也回不来）。
+        // 加上这条之后：失败 3 天后允许再试一次，通了自动恢复，还挂就继续冷却。
+        const recentFail = lastFail > 0 && (t - lastFail < 3 * 86400000);
+        if (total >= minSamples && ok / total < minRate && noRecentOk && recentFail) {
           m.set(name, t + skipMs);
         }
       }
@@ -203,12 +208,18 @@ export function createSourceHealth({
   };
 }
 
+/** 本地日期键（YYYY-MM-DD）。不能用 toISOString：那是 UTC，北京时间 0~8 点的数据会算到"昨天"。 */
+export function localDayKey(t = Date.now()) {
+  const d = new Date(t);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 /** 按天累计的搜索统计（保留最近 keepDays 天）。 */
 export function createStats({ file, log = () => {}, now = () => Date.now(), keepDays = 14 } = {}) {
   const raw = readJsonSafe(file, null, log);
   const data = { v: 1, days: (raw && raw.days && typeof raw.days === 'object') ? raw.days : {} };
   const writer = createDebouncedWriter(file, { log });
-  const dayKey = (t) => new Date(t).toISOString().slice(0, 10);
+  const dayKey = (t) => localDayKey(t);
 
   function bucket() {
     const d = dayKey(now());
