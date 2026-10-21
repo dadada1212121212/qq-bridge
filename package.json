@@ -44,6 +44,8 @@
     "test:dsh-inbox": "node scripts/test-dsh-inbox-projection.mjs",
     "test:session-retire:e2e": "node scripts/test-dsh-session-retire.mjs",
     "verify:persona": "node scripts/verify-persona-config.mjs",
+    "verify:bili": "node scripts/bili-health.mjs",
+    "bili:login": "node scripts/bili-login-qr.mjs --serve",
     "test:mcp-servers": "node scripts/test-mcp-servers-stdio.mjs",
     "test:qzone": "node scripts/test-qzone.mjs",
     "test:dsh-restart": "node scripts/test-dsh-restart-release.mjs",
