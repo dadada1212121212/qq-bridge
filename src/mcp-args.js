@@ -22,10 +22,13 @@ export function pickStr(args, names) {
   return '';
 }
 
+/** 回显参数时不该出现的键：令牌/密钥回显到上下文既无用又浪费 token。 */
+const SECRET_KEYS = new Set(['token', 'apikey', 'api_key', 'secret', 'password', 'cookie', 'sessdata', 'bili_jct']);
+
 /** 把实际收到的参数名拼成一句，用于报错时回显「你到底传了什么」。 */
 export function argNames(args) {
   if (!args || typeof args !== 'object') return '（空）';
-  const keys = Object.keys(args);
+  const keys = Object.keys(args).filter((k) => !SECRET_KEYS.has(k.toLowerCase()));
   return keys.length ? keys.join(' / ') : '（空）';
 }
 
@@ -77,15 +80,20 @@ export function foldAliases(obj, aliasMap) {
   return { value: out, dropped };
 }
 
-/** 统一成字符串数组：接受数组、"a,b"、"a，b"、"a、b"、"a b"。 */
+/** 统一成字符串数组：接受数组、"a,b"、"a，b"、"a、b"、"a b"。数字按字符串收（关键词偶尔被写成数字）。 */
 export function asArray(v) {
-  if (Array.isArray(v)) return v.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim());
+  if (Array.isArray(v)) {
+    return v
+      .map((x) => (typeof x === 'number' && Number.isFinite(x) ? String(x) : x))
+      .filter((x) => typeof x === 'string' && x.trim())
+      .map((x) => x.trim());
+  }
   if (typeof v === 'string') return v.split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean);
   return [];
 }
 
 /**
- * 取「一条或多条消息」参数：字符串原样返回，数组原样返回。
+ * 取「一条或多条消息」参数：字符串原样返回，数组原样返回（只滤掉空串）。
  * 刻意**不**用 asArray 拆空格——那会把「我今天有点累 想早点睡」拆成两条消息发出去。
  */
 export function pickStrOrList(args, names) {
@@ -93,7 +101,11 @@ export function pickStrOrList(args, names) {
   for (const n of names) {
     const v = args[n];
     if (typeof v === 'string' && v.trim()) return v;
-    if (Array.isArray(v) && v.some((x) => typeof x === 'string' && x.trim())) return v;
+    if (Array.isArray(v)) {
+      // 空串必须滤掉：数组里混一个 "" 就会多发出/报错一条空消息。
+      const list = v.filter((x) => typeof x === 'string' && x.trim());
+      if (list.length) return list;
+    }
   }
   return undefined;
 }

@@ -60,6 +60,7 @@
     "probe:events": "node scripts/probe-events.mjs",
     "probe:tools": "node scripts/probe-tools.mjs",
     "probe:protocol": "node scripts/probe-020-protocol.mjs",
+    "probe:wake-aliases": "node scripts/probe-wake-aliases.mjs",
     "probe:settings": "node scripts/probe-020-settings.mjs",
     "probe:heartbeat": "node scripts/probe-snowluma-heartbeat.mjs",
     "scan:tool-names": "node scripts/scan-dsh-tool-names.mjs",

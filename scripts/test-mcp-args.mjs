@@ -37,6 +37,8 @@ t('非对象不炸', pickStr(null, ['query']) === '');
 console.log('## argNames：报错时回显"你到底传了什么"');
 t('列出收到的键', argNames({ bvid: 'BV1', content: 'x' }) === 'bvid / content');
 t('空对象', argNames({}) === '（空）');
+t('不回显令牌（48 位令牌打出来纯浪费）', argNames({ key: 'private:1', token: 'abc', message: 'x' }) === 'key / message', argNames({ token: 'abc' }));
+t('大小写不敏感地挡 secret', argNames({ API_KEY: 'x', Cookie: 'y' }) === '（空）', argNames({ API_KEY: 'x', Cookie: 'y' }));
 
 console.log('## missingArgHint：说清缺哪个 + 你传了什么');
 {
@@ -82,6 +84,20 @@ console.log('## foldAliases：别名折叠 + 认不出的键要报出来');
   t('规范名优先，别名不覆盖它', both.value.atMention === false);
 
   t('非对象不炸', foldAliases(null, map).value === null);
+  t('数组不炸', Array.isArray(foldAliases([1, 2], map).value) === true);
+
+  // 大小写：模型偶尔写成 AT / NAME
+  const upper = foldAliases({ AT: true, NAME: false }, map);
+  t('别名大小写不敏感', upper.value.atMention === true && upper.value.nameMention === false, JSON.stringify(upper.value));
+
+  // 值为 undefined 的键等于没传，不该占位
+  const undef = foldAliases({ atMention: undefined, at: true }, map);
+  t('undefined 不挡住别名折叠', undef.value.atMention === true);
+
+  // 原型链污染：__proto__ 作为自有键时不能挂到原型上
+  const proto = foldAliases(JSON.parse('{"at":true,"__proto__":{"polluted":1}}'), map);
+  t('__proto__ 被当作未知键剥掉', proto.dropped.includes('__proto__'), proto.dropped.join(','));
+  t('没有污染 Object 原型', ({}).polluted === undefined);
 }
 
 console.log('## asArray / pickStrOrList：关键词可拆，消息不能拆');
@@ -96,6 +112,11 @@ console.log('## asArray / pickStrOrList：关键词可拆，消息不能拆');
   t('消息别名回退', pickStrOrList({ message: '在' }, ['messages', 'message']) === '在');
   t('消息数组原样', Array.isArray(pickStrOrList({ messages: ['一', '二'] }, ['messages'])));
   t('全空返回 undefined', pickStrOrList({ messages: '   ' }, ['messages']) === undefined);
+  t('数组里的空串被滤掉', JSON.stringify(pickStrOrList({ messages: ['一', '  ', '二'] }, ['messages'])) === '["一","二"]');
+  t('全空数组返回 undefined', pickStrOrList({ messages: ['', ' '] }, ['messages']) === undefined);
+
+  t('关键词数组里的数字转字符串', JSON.stringify(asArray([1, 'a'])) === '["1","a"]', JSON.stringify(asArray([1, 'a'])));
+  t('非字符串/数组返回空数组', asArray(42).length === 0 && asArray(null).length === 0);
 }
 
 // ── 真实 MCP 协议：别名必须过 zod ────────────────────────────────────────────
