@@ -11,7 +11,7 @@
 //
 // deps 契约：
 //   oneBotCall(action, params)  必需，OneBot HTTP 调用
-//   cfg                       必需，配置对象（读 socialV2.files.maxBytes）
+//   cfg                       必需，配置对象（读 socialV2.files.maxBytes / inboxDir）
 //   ROOT                      必需，仓库根（相对路径解析 base）
 //   STATE_DIR                 必需，状态目录
 //   log                       可选，日志函数（缺省 noop）
@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { localDayString } from './day-key.js';
 
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024; // 50MB
 
@@ -31,13 +32,16 @@ function formatBytes(n) {
   return (n / Math.pow(1024, i)).toFixed(i ? 1 : 0) + u[i];
 }
 
-function localDate() {
-  const d = new Date();
-  const p = (x) => String(x).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+// 索引 seq：同一毫秒内连收两个文件会撞号（Date.now() 相同），之后按 seq 取件会取错。
+// 用「至少比上一个大 1」保证进程内严格递增；重启后 Date.now() 必然大于旧值，无需持久化。
+let lastSeq = 0;
+function nextSeq() {
+  const now = Date.now();
+  lastSeq = now > lastSeq ? now : lastSeq + 1;
+  return lastSeq;
 }
 
-// 收件目录覆盖状态：AI 经 qq_set_inbox_dir 设置「接收文件存到哪」，持久化到磁盘。
+// 收件目录覆盖状态：AI 经 setInboxDir 设置「接收文件存到哪」，持久化到磁盘。
 // 只接受 Windows 盘符绝对路径，避免相对路径/网络路径造成歧义或越界写盘。
 function isAbsWinDir(s) {
   return /^[A-Za-z]:[\\/]/.test(String(s || '').trim());
@@ -75,8 +79,14 @@ function winPathToWslRef(raw, ROOT) {
 function sanitizeName(name) {
   let s = String(name ?? '').trim();
   if (!s) s = 'file';
-  // 去掉路径分隔符与控制字符，统一空格
-  s = s.replace(/[\\/:*?"<>|-\x7f]/g, '_').replace(/\s+/g, ' ').trim();
+  // 去掉路径分隔符、Windows 非法字符与控制字符，统一空格。
+  // ⚠️ 这里必须写 `\x00-\x1f` 的**转义形式**：曾经在源码里嵌裸控制字节（0x01/0x1F），
+  // 功能等价但编辑器/格式化工具一碰就坏，且肉眼看不出正则到底匹配了什么。
+  // 也不能写成 `|-\x7f`：那样 `|` 与 `\x7f` 之间会被当成字符范围（`|` `}` `~` DEL），
+  // 把正常文件名里的 `~` `}` 也替换掉。
+  s = s.replace(/[\\/:*?"<>|\x00-\x1f\x7f]/g, '_').replace(/\s+/g, ' ').trim();
+  // Windows 不允许以点或空格结尾的文件名。
+  s = s.replace(/[. ]+$/, '').trim();
   if (s.length > 120) s = s.slice(0, 120).trim();
   if (!s) s = 'file';
   return s;
@@ -95,55 +105,93 @@ async function uniquePath(dir, name) {
   return path.join(dir, `${name}.${Date.now()}`);
 }
 
+// 取第一个非空字符串（去空白）。用于抹平各家 OneBot 实现的字段命名差异。
+function pickStr(...vals) {
+  for (const v of vals) {
+    if (v === undefined || v === null) continue;
+    const s = String(v).trim();
+    if (s) return s;
+  }
+  return '';
+}
+function pickNum(...vals) {
+  for (const v of vals) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
 // 归一各种 notice 结构的字段。返回 null 表示不像文件事件。
+//
+// ⚠️ 真实报文里文件字段是**嵌套在 `file` 对象里**的，而且 id 的键名各家不同：
+//   go-cqhttp / NapCat 私聊：{ notice_type:'offline_file', user_id, file:{ id, name, size, url } }
+//   NapCat 部分版本：        { notice_type:'offline_file', user_id, file:{ uuid, name, size, url } }
+//   标准群文件：             { notice_type:'group_upload', group_id, user_id, file:{ id, name, size, busid } }
+// 早期版本只读顶层 `file_id`，导致以上三种**全部解析成 null**、只能走 dump 分支
+// （数据不丢，但永远下不下来）。现在先解包 `file`，再回退到顶层字段。
 function parseNotice(e) {
   if (!e || typeof e !== 'object') return null;
-  const fileId = e.file_id || e.fileId || null;
+  // `file` 可能是对象，也可能直接是字符串形式的 file_id。
+  const rawFile = e.file;
+  const f = rawFile && typeof rawFile === 'object' ? rawFile : {};
+  const fileStr = typeof rawFile === 'string' ? rawFile.trim() : '';
+  const fileId = pickStr(
+    f.id, f.file_id, f.fileId, f.uuid, fileStr,
+    e.file_id, e.fileId, e.uuid
+  );
   if (!fileId) return null;
-  const name = e.file_name || e.fileName || e.name || null;
-  const size = Number(e.file_size || e.fileSize || e.size || 0) || 0;
-  const fileHash = e.file_hash || e.fileHash || '';
-  const busid = e.busid || undefined;
-  const groupId = e.group_id || e.groupId || null;
-  const userId = e.user_id || e.userId || null;
+  const name = pickStr(f.name, f.file_name, f.fileName, e.file_name, e.fileName, e.name) || null;
+  const size = pickNum(f.size, f.file_size, f.fileSize, e.file_size, e.fileSize, e.size);
+  const fileHash = pickStr(f.file_hash, f.fileHash, f.md5, e.file_hash, e.fileHash);
+  const busid = pickNum(f.busid, e.busid) || undefined;
+  // offline_file 通常自带下载直链，优先用它，省一次 API 往返，也绕开
+  // 「get_private_file_url 并非所有实现都支持」的兼容问题。
+  const url = pickStr(f.url, f.file_url, f.fileUrl, e.url, e.file_url);
+  const groupId = pickStr(e.group_id, e.groupId) || null;
+  const userId = pickStr(e.user_id, e.userId);
   const kind = groupId ? 'group' : 'private';
-  const qq = String(groupId || userId || '');
   return {
-    fileId: String(fileId),
+    fileId,
     name,
     size,
-    fileHash: String(fileHash),
+    fileHash,
     busid,
+    url,
     kind,
-    fromQQ: qq,
+    fromQQ: String(groupId || userId || ''),
     fromKey: groupId ? `group:${groupId}` : `private:${userId}`,
+    noticeType: pickStr(e.notice_type, e.noticeType)
   };
 }
 
 async function downloadFile(p, oneBotCall) {
-  let url = null;
-  if (p.kind === 'private') {
-    const r = await oneBotCall('get_private_file_url', {
-      user_id: Number(p.fromQQ),
-      file_id: p.fileId,
-      file_hash: p.fileHash,
-    }).catch(() => null);
-    url = r?.url || r?.file_url || null;
-  } else {
-    const r = await oneBotCall('get_group_file_url', {
-      group_id: Number(p.fromQQ),
-      file_id: p.fileId,
-      busid: p.busid,
-    }).catch(() => null);
-    url = r?.url || r?.file_url || null;
+  // ① 事件自带直链（offline_file 基本都有）——直接用。
+  let url = /^https?:/i.test(p.url || '') ? p.url : null;
+  if (!url) {
+    if (p.kind === 'private') {
+      const r = await oneBotCall('get_private_file_url', {
+        user_id: Number(p.fromQQ),
+        file_id: p.fileId,
+        file_hash: p.fileHash,
+      }).catch(() => null);
+      url = r?.url || r?.file_url || null;
+    } else {
+      const r = await oneBotCall('get_group_file_url', {
+        group_id: Number(p.fromQQ),
+        file_id: p.fileId,
+        busid: p.busid,
+      }).catch(() => null);
+      url = r?.url || r?.file_url || null;
+    }
   }
   if (!url && p.fileId) {
-    // 兜底：OneBot 通用媒体下载，可能直接返回 base64。
+    // ② 兜底：OneBot 通用媒体下载，可能直接返回 base64。
     const g = await oneBotCall('get_file', { file_id: p.fileId }).catch(() => null);
     if (g?.base64) return Buffer.from(g.base64, 'base64');
     if (g?.url) url = g.url;
   }
-  if (!url) throw new Error('无法获取文件下载 URL（可能缺少 file_hash 或事件结构不兼容）');
+  if (!url) throw new Error('无法获取文件下载 URL（事件未带 url，且 get_*_file_url / get_file 都没返回）');
   const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
   if (!res.ok) throw new Error('下载 HTTP ' + res.status);
   return Buffer.from(await res.arrayBuffer());
@@ -163,7 +211,7 @@ function appendIndex(stateDir, entry) {
   const dir = path.join(stateDir, 'files');
   fs.mkdirSync(dir, { recursive: true });
   const f = path.join(dir, 'inbox-index.jsonl');
-  const seq = Date.now();
+  const seq = nextSeq();
   const line = JSON.stringify({ seq, ...entry });
   fs.appendFileSync(f, line + '\n');
   return seq;
@@ -182,7 +230,7 @@ export function createFileTransfer(deps) {
   const TRANSFER_STATE = path.join(STATE_DIR, 'files', 'transfer-state.json');
 
   // 计算实际收件目录，优先级：AI 指定的覆盖 > 配置 socialV2.files.inboxDir > 默认 state/files/inbox。
-  // 自定义/配置目录直接平铺存放（不再按日期分子目录，因为用户已明确指定位置）；默认目录按日期归档。
+  // AI 指定/配置的目录直接平铺存放（用户已明确位置，再套一层日期反而烦）；默认目录按日期归档。
   function resolveInboxDir() {
     const st = readTransferState(TRANSFER_STATE);
     if (st.inboxDir && isAbsWinDir(st.inboxDir)) {
@@ -248,7 +296,7 @@ export function createFileTransfer(deps) {
   async function handleFileNotice(event) {
     const parsed = parseNotice(event);
     const { dir: baseDir, withDate } = resolveInboxDir();
-    const dir = withDate ? path.join(baseDir, localDate()) : baseDir;
+    const dir = withDate ? path.join(baseDir, localDayString()) : baseDir;
     fs.mkdirSync(dir, { recursive: true });
     if (!parsed || !parsed.fileId) {
       const dump = path.join(dir, `${Date.now()}.unknown-event.json`);
@@ -280,7 +328,9 @@ export function createFileTransfer(deps) {
       fileId: parsed.fileId,
       fileHash: parsed.fileHash,
       kind: parsed.kind,
+      noticeType: parsed.noticeType,
       downloaded: !!buf,
+      ...(downloadErr ? { downloadErr } : {}),
     });
     return {
       ok: true,

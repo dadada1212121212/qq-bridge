@@ -3,6 +3,7 @@ import { createFileTransfer } from '../src/file-transfer.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-test-'));
 const STATE = path.join(tmp, 'state');
@@ -29,7 +30,10 @@ function findInDir(dir, suffix) {
 }
 
 let pass = 0, fail = 0;
-function ok(name, cond) { if (cond) { pass++; console.log('  ✓', name); } else { fail++; console.log('  ✗', name); } }
+function ok(name, cond, extra = '') {
+  if (cond) { pass++; console.log('  ✓', name + (extra ? `（${extra}）` : '')); }
+  else { fail++; console.log('  ✗', name + (extra ? `（${extra}）` : '')); }
+}
 
 // 1. 路径转换 + 私聊 action
 {
@@ -142,6 +146,93 @@ function ok(name, cond) { if (cond) { pass++; console.log('  ✓', name); } else
   // 8f. 传空恢复默认
   const clr = ft.setInboxDir('');
   ok('传空恢复默认', clr.ok === true && clr.cleared === true && clr.inboxDir.startsWith(path.join(STATE, 'files', 'inbox')));
+}
+
+// 9. 真实 notice 结构回归（2026-10-21 补）
+//
+// ⚠️ 第 7 节用的是**扁平**结构（顶层 file_id / file_name），那是早期按文档臆造的。
+// 真实 QQ 报文把文件字段**嵌在 `file` 对象里**，而且 id 的键名各家不同：
+//   go-cqhttp / NapCat：file.id、file.uuid；标准群文件：file.busid。
+// 之前只读顶层，导致三种真实结构**全部解析成 null**，线上真收到文件只会走 dump 分支
+// （数据不丢，但永远下不下来）。这一节钉住这些结构。
+{
+  const PAYLOAD = '真实报文下载的内容\n第二行\n';
+  const server = http.createServer((req, res) => { res.writeHead(200); res.end(Buffer.from(PAYLOAD, 'utf8')); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const dlUrl = `http://127.0.0.1:${server.address().port}/f`;
+
+  // 9a. go-cqhttp 私聊：file:{ id, name, size, url }，自带直链 ⇒ 不该再调 API
+  {
+    let apiCalls = 0;
+    const ft = createFileTransfer({
+      oneBotCall: async () => { apiCalls++; return {}; },
+      cfg: {}, ROOT: tmp, STATE_DIR: STATE, log: () => {},
+    });
+    const r = await ft.handleFileNotice({
+      post_type: 'notice', notice_type: 'offline_file', self_id: 3901900049, user_id: 3796180411,
+      file: { id: 'abc123', name: '嵌套 报告~1.txt', size: Buffer.byteLength(PAYLOAD), url: dlUrl },
+    });
+    ok('嵌套 file.id 能解析并下载', r.ok === true && r.meta.downloaded === true);
+    ok('嵌套结构下内容正确', fs.readFileSync(r.savedPath, 'utf8') === PAYLOAD);
+    ok('事件自带 url 时不再调 API', apiCalls === 0);
+    ok('文件名保留 ~ 与中文（不被误替换）', r.meta.name === '嵌套 报告~1.txt');
+    ok('索引记录了 noticeType', ft.listInbox(1).items[0]?.noticeType === 'offline_file');
+  }
+
+  // 9b. NapCat 私聊：file:{ uuid, ... }
+  {
+    const ft = createFileTransfer({
+      oneBotCall: async (a) => (a === 'get_private_file_url' ? { url: dlUrl } : {}),
+      cfg: {}, ROOT: tmp, STATE_DIR: STATE, log: () => {},
+    });
+    const r = await ft.handleFileNotice({
+      notice_type: 'offline_file', user_id: 3796180411,
+      file: { uuid: 'uuid-999', name: 'napcat.txt', size: 10 },
+    });
+    ok('嵌套 file.uuid 能解析', r.ok === true && r.meta.downloaded === true);
+  }
+
+  // 9c. 标准群文件：file:{ id, busid } ⇒ 走 get_group_file_url 且带上 busid
+  {
+    let seen = null;
+    const ft = createFileTransfer({
+      oneBotCall: async (a, p) => { if (a === 'get_group_file_url') { seen = { a, p }; return { url: dlUrl }; } return {}; },
+      cfg: {}, ROOT: tmp, STATE_DIR: STATE, log: () => {},
+    });
+    const r = await ft.handleFileNotice({
+      notice_type: 'group_upload', group_id: 429626254, user_id: 111,
+      file: { id: 'gid1', name: '群文件.zip', size: 999, busid: 102 },
+    });
+    ok('群文件走 get_group_file_url', seen?.a === 'get_group_file_url');
+    ok('busid 从嵌套 file 里取到', seen?.p?.busid === 102);
+    ok('群文件接收 ok', r.ok === true && r.meta.downloaded === true);
+  }
+
+  // 9d. file 直接是字符串（只有 id，没有 url）
+  {
+    let seen = null;
+    const ft = createFileTransfer({
+      oneBotCall: async (a, p) => { if (a === 'get_private_file_url') { seen = p; return { url: dlUrl }; } return {}; },
+      cfg: {}, ROOT: tmp, STATE_DIR: STATE, log: () => {},
+    });
+    const r = await ft.handleFileNotice({ notice_type: 'offline_file', user_id: 3796180411, file: 'str-id-1' });
+    ok('file 为字符串时按 id 取链', seen?.file_id === 'str-id-1' && r.meta.downloaded === true);
+  }
+
+  // 9e. 同一毫秒连收两个：seq 必须严格递增（否则按 seq 取件会取错）
+  {
+    const ft = createFileTransfer({
+      oneBotCall: async () => ({ base64: Buffer.from('x').toString('base64') }),
+      cfg: {}, ROOT: tmp, STATE_DIR: STATE, log: () => {},
+    });
+    const ev = { notice_type: 'offline_file', user_id: 3796180411, file: { id: 'S', name: 's.txt', url: dlUrl } };
+    const a = await ft.handleFileNotice(ev);
+    const b = await ft.handleFileNotice(ev);
+    const c = await ft.handleFileNotice(ev);
+    ok('连收三份 seq 严格递增', a.meta.seq < b.meta.seq && b.meta.seq < c.meta.seq, `${a.meta.seq}/${b.meta.seq}/${c.meta.seq}`);
+  }
+
+  server.close();
 }
 
 console.log(`\n结果：${pass} 通过, ${fail} 失败`);
