@@ -224,6 +224,12 @@ function writeRoleMode(mode) {
 /** 执行一条命令，返回要回复的文本。纯函数式地集中在这里，方便单测。 */
 export async function executeCommand({ cmd, args }, deps) {
   const { send, config, restartBridge, startBridge, stopBridge, portOpen: portFn } = deps;
+  // [养鱼 2026-10-21] 角色模式的读写必须可注入。事故：test-wake-bot 的 /silent 用例
+  // 直接调了这里的真实 writeRoleMode，而 STATE_DIR 指向**真实** state/ ——
+  // 于是跑一次 `npm test` 就把线上机器人切成静默（群聊一票否决），机器人看起来"死了"。
+  // 现在测试传替身即可，生产路径行为完全不变。
+  const readMode = typeof deps.readRoleMode === 'function' ? deps.readRoleMode : readRoleMode;
+  const writeMode = typeof deps.writeRoleMode === 'function' ? deps.writeRoleMode : writeRoleMode;
   const bridgeUp = await portFn(3100);
   const dshUp = await portFn(3080);
   switch (cmd) {
@@ -239,7 +245,7 @@ export async function executeCommand({ cmd, args }, deps) {
         '/set  <路径> <值> 改配置并重启，例 /set socialV2.thinkingFiller.enabled off',
       ].join('\n');
     case 'status': {
-      const mode = readRoleMode() === 'silent' ? '静默（只在私聊回话）' : 'active（正常接话）';
+      const mode = readMode() === 'silent' ? '静默（只在私聊回话）' : 'active（正常接话）';
       return [
         '桥接：' + (bridgeUp ? '在跑（3100）' : '没跑 —— 发 /start 叫我'),
         'DSH：' + (dshUp ? '可达（3080）' : '不可达'),
@@ -266,9 +272,9 @@ export async function executeCommand({ cmd, args }, deps) {
     }
     case 'silent': {
       const a = String(args || '').toLowerCase();
-      if (a === 'on' || a === '开') { writeRoleMode('silent'); return '已切到静默：群里不接话，只回你私聊。'; }
-      if (a === 'off' || a === '关') { writeRoleMode('active'); return '已恢复：按唤醒配置正常接话。'; }
-      return '用法：/silent on 或 /silent off（现在是 ' + readRoleMode() + '）';
+      if (a === 'on' || a === '开') { writeMode('silent'); return '已切到静默：群里不接话，只回你私聊。'; }
+      if (a === 'off' || a === '关') { writeMode('active'); return '已恢复：按唤醒配置正常接话。'; }
+      return '用法：/silent on 或 /silent off（现在是 ' + readMode() + '）';
     }
     case 'get': {
       if (!args) return '用法：/get socialV2.memoryDb.maxChars';

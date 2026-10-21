@@ -42,7 +42,8 @@ test('chunkText：长回复切片，不丢字', () => {
 });
 
 function fakeDeps(over = {}) {
-  const calls = { sent: [], started: 0, stopped: 0, restarted: 0, sets: [] };
+  const calls = { sent: [], started: 0, stopped: 0, restarted: 0, sets: [], roleMode: [] };
+  let mode = 'active';
   return {
     calls,
     deps: {
@@ -53,6 +54,10 @@ function fakeDeps(over = {}) {
       restartBridge: async () => { calls.restarted += 1; return { ok: true, out: 'new pid=2' }; },
       portOpen: async () => false,
       applySetting: (p, v) => { calls.sets.push([p, v]); return 'config.json'; },
+      // [养鱼 2026-10-21] 必须替身：真实实现写的是 state/current-role.json，
+      // 不替身就等于"跑一次测试把线上机器人切成静默"。见文件末尾的硬回归。
+      readRoleMode: () => mode,
+      writeRoleMode: (m) => { mode = m; calls.roleMode.push(m); },
       ...over,
     },
   };
@@ -79,11 +84,35 @@ test('/start：桥接没跑时启动它；已经在跑就不重复启动', async
 });
 
 test('/silent：写模式文件并回执', async () => {
-  const { deps } = fakeDeps();
+  const { deps, calls } = fakeDeps();
   const t = await executeCommand({ cmd: 'silent', args: 'on' }, deps);
   assert.ok(/静默/.test(t));
+  assert.deepEqual(calls.roleMode, ['silent'], '应该写 silent');
   const bad = await executeCommand({ cmd: 'silent', args: '也许' }, deps);
   assert.ok(bad.includes('用法'));
+  assert.deepEqual(calls.roleMode, ['silent'], '非法参数不许写');
+  const off = await executeCommand({ cmd: 'silent', args: 'off' }, deps);
+  assert.ok(/已恢复/.test(off));
+  assert.deepEqual(calls.roleMode, ['silent', 'active']);
+});
+
+// [养鱼 2026-10-21] 硬回归：跑测试**绝不能**动线上的角色状态。
+// 事故：/silent 用例直接调了真实的 writeRoleMode（STATE_DIR 指向真实 state/），
+// 于是每跑一次 npm test 就把线上机器人切成静默，群里一条都不回，看着像"死了"。
+test('执行 /silent 不许碰真实 state/current-role.json', async () => {
+  const real = new URL('../state/current-role.json', import.meta.url);
+  const before = fs.existsSync(real) ? fs.readFileSync(real, 'utf8') : null;
+  const beforeMtime = fs.existsSync(real) ? fs.statSync(real).mtimeMs : null;
+
+  const { deps } = fakeDeps();
+  await executeCommand({ cmd: 'silent', args: 'on' }, deps);
+  await executeCommand({ cmd: 'silent', args: 'off' }, deps);
+  await executeCommand({ cmd: 'status', args: '' }, deps);
+
+  const after = fs.existsSync(real) ? fs.readFileSync(real, 'utf8') : null;
+  const afterMtime = fs.existsSync(real) ? fs.statSync(real).mtimeMs : null;
+  assert.equal(after, before, '真实角色状态被测试改写了！');
+  assert.equal(afterMtime, beforeMtime, '真实角色状态文件被测试重写了（内容相同也不行）');
 });
 
 test('/set：白名单外拒绝；白名单内走 applySetting 并重启桥接', async () => {
