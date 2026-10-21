@@ -99,4 +99,81 @@ try {
   pass++;
   console.log('  ✅ videoInfo（桩）：归一化');
 } catch (e) { console.error(`✗ videoInfo（桩）: ${e?.message || e}`); process.exitCode = 1; }
+// ── 登录态（2026-10-21 补）─────────────────────────────────────────────────
+//
+// 背景：`ensureAuth` 原来校验 `a.biliJct`（驼峰），而导入脚本写的是 `bili_jct`（下划线，
+// 跟真实 cookie 名一致）⇒ 校验永远失败、cookie 头发成 `bili_jct=undefined`，写操作全废。
+// 这一节钉住「字段归一」和「cookie 头 / csrf 真的带上了值」。
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const authTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bili-auth-'));
+const authBili = createBili({ fetchImpl: () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) }) });
+
+{
+  authBili._internal.setAuthLoader(async () => ({ SESSDATA: 's1', bili_jct: 'j1', DedeUserID: '1001' }));
+  const a = await authBili._internal.ensureAuth();
+  ok('ensureAuth：下划线字段通过', () => {
+    assert.equal(a.bili_jct, 'j1');
+    assert.equal(a.SESSDATA, 's1');
+    assert.equal(a.DedeUserID, '1001');
+  });
+}
+{
+  // 兼容老写法（驼峰），别让手工编辑过的文件突然失效。
+  authBili._internal.setAuthLoader(async () => ({ SESSDATA: 's2', biliJct: 'j2', DedeUserID: 1002 }));
+  const a = await authBili._internal.ensureAuth();
+  ok('ensureAuth：驼峰字段也能归一', () => {
+    assert.equal(a.bili_jct, 'j2');
+    assert.equal(a.DedeUserID, '1002', '数字要转成字符串');
+  });
+}
+{
+  authBili._internal.setAuthLoader(async () => ({ SESSDATA: 's3' }));
+  let msg = '';
+  try { await authBili._internal.ensureAuth(); } catch (e) { msg = e.message; }
+  ok('ensureAuth：缺字段要报出缺哪个', () => {
+    assert.match(msg, /bili_jct/);
+    assert.match(msg, /DedeUserID/);
+  });
+}
+{
+  authBili._internal.setAuthLoader(async () => null);
+  let msg = '';
+  try { await authBili._internal.ensureAuth(); } catch (e) { msg = e.message; }
+  ok('ensureAuth：文件为空要给出可操作提示', () => { assert.match(msg, /bili-account\.json/); });
+}
+
+// 端到端：点赞时 cookie 头和 csrf 必须都是真值（不是 undefined）
+{
+  const CSRF = 'csrf-token-abc';
+  const seen = [];
+  const stub = (url, init = {}) => {
+    seen.push({ url: String(url), headers: init.headers || {}, body: String(init.body || '') });
+    const p = String(url).replace('https://api.bilibili.com', '').split('?')[0];
+    const reply = p.includes('finger/spi') ? { code: 0, data: { b_3: 'buvid3-x' } }
+      : p.includes('web-interface/view') ? responses['web-interface/view']
+        : p.includes('archive/like') ? { code: 0 }
+          : { code: -400, message: 'stub 没配: ' + p };
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(reply) });
+  };
+  const b = createBili({ fetchImpl: stub });
+  b._internal.setAuthLoader(async () => ({ SESSDATA: 'sess-x', bili_jct: CSRF, DedeUserID: '1001' }));
+  b._internal.setQuotaFile(path.join(authTmp, 'quota.json'));
+  try {
+    await b.likeVideo('BV1GJ411x7h7');
+    const like = seen.find((c) => c.url.includes('archive/like'));
+    ok('点赞：cookie 头带真 bili_jct', () => {
+      assert.ok(like, '没发出 like 请求');
+      assert.ok(like.headers.cookie.includes(`bili_jct=${CSRF}`), '实际 cookie：' + like.headers.cookie);
+      assert.ok(!like.headers.cookie.includes('undefined'), 'cookie 里出现 undefined');
+      assert.ok(like.headers.cookie.includes('SESSDATA=sess-x'));
+      assert.ok(like.headers.cookie.includes('DedeUserID=1001'));
+    });
+    ok('点赞：csrf 用真值', () => { assert.ok(like.body.includes('csrf=' + CSRF), '实际 body：' + like.body); });
+    console.log('  ✅ likeVideo（桩）：cookie 头与 csrf 都是真值');
+  } catch (e) { console.error(`✗ likeVideo（桩）: ${e?.message || e}`); process.exitCode = 1; }
+}
+
 console.log(`test-bilibili-lib: ${pass} 断言通过${process.exitCode ? '（存在失败）' : ''}`);

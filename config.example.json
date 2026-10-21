@@ -152,6 +152,25 @@
       "maxBytes": 52428800,
       "inboxDir": ""
     },
+    "biliStroll": {
+      "enabled": false,
+      "minHour": 14,
+      "maxHour": 21,
+      "hourlyProbability": 0.3
+    },
+    "biliFollow": {
+      "enabled": false,
+      "minHour": 19,
+      "maxHour": 23,
+      "checksPerDay": 2,
+      "list": []
+    },
+    "biliReply": {
+      "enabled": true,
+      "minHour": 19,
+      "maxHour": 23,
+      "checksPerDay": 2
+    },
     "wake": {
       "catchUpMaxAgeMs": 900000,
       "defaultMode": "diving",

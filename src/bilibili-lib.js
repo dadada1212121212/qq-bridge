@@ -68,7 +68,7 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
       // （主人导出，不入库不进 git）。写操作的 referer 必须是具体页面路径，这里用主站兜底。
       if (auth) {
         const a = await ensureAuth();
-        headers.cookie = `SESSDATA=${a.SESSDATA}; bili_jct=${a.biliJct}; DedeUserID=${a.DedeUserID}`;
+        headers.cookie = `SESSDATA=${a.SESSDATA}; bili_jct=${a.bili_jct}; DedeUserID=${a.DedeUserID}`;
       }
       const init = { signal: ctrl.signal, headers };
       if (method !== 'GET') {
@@ -84,14 +84,28 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
     }
   }
 
-  // [养鱼 2026-10-19] 登录态：{ SESSDATA, biliJct, DedeUserID }。authLoader 由 MCP 壳注入
+  // [养鱼 2026-10-19] 登录态：{ SESSDATA, bili_jct, DedeUserID }。authLoader 由 MCP 壳注入
   // （读 state/bili-account.json），库层不碰文件系统，方便单测。
+  //
+  // ⚠️ 字段名统一用**真实 cookie 名**（下划线 bili_jct），因为导入脚本是直接按 cookie 名
+  // 抓的、写进文件的也是 bili_jct。早期这里读的是 `a.biliJct`（驼峰）⇒ 校验永远失败、
+  // cookie 头发成 `bili_jct=undefined`，写操作全废。归一放在这一处，下游一律用 bili_jct。
   let authLoader = null;
   function setAuthLoader(loader) { authLoader = loader; }
   async function ensureAuth() {
     if (!authLoader) throw new Error('B 站账号还没接入：这是写操作，需要先导入登录 cookie（见 bili-account.json 的导入说明）');
-    const a = await authLoader();
-    if (!a?.SESSDATA || !a?.biliJct || !a?.DedeUserID) throw new Error('B 站 cookie 不完整（需要 SESSDATA / bili_jct / DedeUserID 三个字段），重新导一次');
+    const raw = await authLoader();
+    if (!raw || typeof raw !== 'object') throw new Error('B 站账号文件读不出来：state/bili-account.json 不是合法 JSON，重新导一次');
+    const a = {
+      SESSDATA: String(raw.SESSDATA || '').trim(),
+      // 兼容驼峰写法：老版本测试/手工编辑的文件里可能只有 biliJct。
+      bili_jct: String(raw.bili_jct || raw.biliJct || '').trim(),
+      DedeUserID: String(raw.DedeUserID || raw.dedeUserId || '').trim(),
+    };
+    const missing = ['SESSDATA', 'bili_jct', 'DedeUserID'].filter((k) => !a[k]);
+    if (missing.length) {
+      throw new Error(`B 站 cookie 不完整（缺 ${missing.join(' / ')}），重新导一次：node scripts/bili-import-cookie.mjs --stdin`);
+    }
     return a;
   }
 
@@ -349,7 +363,7 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
     if (!rootRpid) quotaCheckVideoOnce(q, v.aid); // 盖楼回复不限「同视频一次」，顶层评论才限
     quotaTake(q, 'comments'); // 先占额度：写入失败也不返还，比超发安全
     const a = await ensureAuth();
-    const body = new URLSearchParams({ oid: String(v.aid), type: '1', message: text, plat: '1', csrf: a.biliJct });
+    const body = new URLSearchParams({ oid: String(v.aid), type: '1', message: text, plat: '1', csrf: a.bili_jct });
     if (rootRpid) { body.set('root', rootRpid); body.set('parent', rootRpid); }
     const j = await rawJson(`${API}/x/v2/reply/add`, { method: 'POST', body: body.toString(), auth: true });
     if (j?.code !== 0) {
@@ -428,7 +442,7 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
     quotaCheckVideoOnce(q, v.aid);
     quotaTake(q, 'likes');
     const a = await ensureAuth();
-    const body = new URLSearchParams({ aid: String(v.aid), like: '1', csrf: a.biliJct });
+    const body = new URLSearchParams({ aid: String(v.aid), like: '1', csrf: a.bili_jct });
     const j = await rawJson(`${API}/x/web-interface/archive/like`, { method: 'POST', body: body.toString(), auth: true });
     if (j?.code !== 0) { saveQuota(q); throw new Error(`点赞失败（code ${j?.code}）：${j?.message || j?.msg || '未知原因'}`); }
     saveQuota(q);
@@ -444,7 +458,7 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
     quotaCheckVideoOnce(q, v.aid);
     quotaTake(q, 'coins');
     const a = await ensureAuth();
-    const body = new URLSearchParams({ oid: String(v.aid), bvid: v.bvid, multiply: '1', select_like: '0', csrf: a.biliJct });
+    const body = new URLSearchParams({ oid: String(v.aid), bvid: v.bvid, multiply: '1', select_like: '0', csrf: a.bili_jct });
     const j = await rawJson(`${API}/x/web-interface/coin/add`, { method: 'POST', body: body.toString(), auth: true });
     if (j?.code !== 0) { saveQuota(q); throw new Error(`投币失败（code ${j?.code}）：${j?.message || j?.msg || '未知原因（硬币不足/自己视频/风控）'}`); }
     saveQuota(q);
