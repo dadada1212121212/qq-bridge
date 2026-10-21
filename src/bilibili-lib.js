@@ -473,6 +473,27 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
 }
 
 /** 去掉搜索结果标题里的 <em class="keyword"> 高亮标签。 */
+/**
+ * 从「扫码登录成功后 B 站回调的那个 URL」里取出 cookie 三件套。
+ *
+ * 回调形如：
+ *   https://passport.biligame.com/crossDomain?DedeUserID=123&DedeUserID__ckMd5=abc
+ *     &Expires=1700000000&SESSDATA=xxxx%2Cyyyy&bili_jct=csrf&gourl=...
+ *
+ * ⚠️ **绝不能**用 `new URL(u).searchParams.get('SESSDATA')`：那会把 `%2C` 解码成逗号。
+ * 而 SESSDATA 里的 `%2C` 是 cookie 值**本身**（浏览器发出去就是带 %2C 的原文），
+ * 解码后再当 cookie 用，B 站会认为令牌无效。所以这里按原文取，不解码。
+ */
+export function parseQrLoginUrl(url) {
+  const s = String(url || '');
+  const qs = s.includes('?') ? s.slice(s.indexOf('?') + 1) : s;
+  const raw = (name) => {
+    const m = new RegExp(`(?:^|&)${name}=([^&]*)`).exec(qs);
+    return m ? m[1].trim() : '';
+  };
+  return { SESSDATA: raw('SESSDATA'), bili_jct: raw('bili_jct'), DedeUserID: raw('DedeUserID') };
+}
+
 export function stripEm(s) {
   return String(s ?? '').replace(/<em[^>]*>/g, '').replace(/<\/em>/g, '');
 }

@@ -2,7 +2,7 @@
 // 真机冒烟（view/search/popular/card 四接口）在实现当晚已人工跑通；这里只测纯逻辑，CI 可离线跑。
 import assert from 'node:assert/strict';
 import {
-  mixinKey, wbiSign, parseVideoId, stripEm, formatVideos, formatDuration, createBili
+  mixinKey, wbiSign, parseVideoId, stripEm, formatVideos, formatDuration, createBili, parseQrLoginUrl
 } from '../src/bilibili-lib.js';
 
 let pass = 0;
@@ -175,5 +175,23 @@ const authBili = createBili({ fetchImpl: () => Promise.resolve({ ok: true, statu
     console.log('  ✅ likeVideo（桩）：cookie 头与 csrf 都是真值');
   } catch (e) { console.error(`✗ likeVideo（桩）: ${e?.message || e}`); process.exitCode = 1; }
 }
+
+// 扫码登录回调 URL 解析（2026-10-21 补）
+ok('parseQrLoginUrl：取到三件套', () => {
+  const r = parseQrLoginUrl('https://passport.biligame.com/crossDomain?DedeUserID=12345&DedeUserID__ckMd5=abc&Expires=1700000000&SESSDATA=xxx&bili_jct=csrf1&gourl=https%3A%2F%2Fwww.bilibili.com');
+  assert.equal(r.SESSDATA, 'xxx');
+  assert.equal(r.bili_jct, 'csrf1');
+  assert.equal(r.DedeUserID, '12345');
+});
+ok('parseQrLoginUrl：SESSDATA 里的 %2C 不能被解码', () => {
+  // %2C 是 cookie 值**本身**（浏览器就发这个原文）。用 searchParams.get 会解码成逗号 ⇒ 令牌失效。
+  const r = parseQrLoginUrl('https://x/crossDomain?SESSDATA=abc%2Cdef%2Cghi&bili_jct=j&DedeUserID=9');
+  assert.equal(r.SESSDATA, 'abc%2Cdef%2Cghi');
+});
+ok('parseQrLoginUrl：缺字段返回空串不抛', () => {
+  const r = parseQrLoginUrl('https://x/crossDomain?foo=1');
+  assert.deepEqual(r, { SESSDATA: '', bili_jct: '', DedeUserID: '' });
+  assert.deepEqual(parseQrLoginUrl(''), { SESSDATA: '', bili_jct: '', DedeUserID: '' });
+});
 
 console.log(`test-bilibili-lib: ${pass} 断言通过${process.exitCode ? '（存在失败）' : ''}`);
