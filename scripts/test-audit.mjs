@@ -176,6 +176,8 @@ const tests = [
   'test-bilibili-lib.mjs',
   // [MCP 参数容错 2026-10-21] 模型猜错参数名（keyword/bvid/silent）不许再白烧一轮。
   'test-mcp-args.mjs',
+  // [等对方说完 2026-10-21] 对面正在打字时发送要让路，且有上限、只对私聊生效。
+  'test-peer-typing.mjs',
   // [小游戏 / 回合游戏 / 点歌] 纯逻辑 + 端点契约。
   'test-light-games.mjs', 'test-turn-games.mjs', 'test-music-links.mjs',
   // [印象 / 情景记忆 / 待办承诺] 记忆链路。

@@ -2388,6 +2388,69 @@ async function main() {
     }
   }
 
+  // ── 等对方说完：对面正在打字就先别开口 ────────────────────────────────────
+  //
+  // 上游（SnowLuma 1.14.x，实测 index.mjs 里 convertFriendInputStatus）会把 QQ 的
+  // InputStatusNotify 转成一条 notice：
+  //   { notice_type: 'notify', sub_type: 'input_status', user_id, event_type, status_text }
+  // event_type：1 = 正在输入，3 = 正在讲话（录音中）。**只有私聊有**（friend_input_status），
+  // 群聊上游根本不推 —— 所以这个闸门天然只在私聊生效，不用额外判群。
+  //
+  // 关键限制（决定了实现方式）：QQ 只在对方**开始**输入时推一次，没有"停止输入"事件，
+  // 也不持续推。所以它只能当"接下来几秒大概率会发消息"的预告，不能当持续状态。
+  // 于是做成宽限窗口：收到信号后先等 graceMs 再开口；窗口内又来信号就顺延；
+  // 但总等待封顶 maxWaitMs —— 对方写长文时不能让她永远不说话。
+  //
+  // 为什么卡在"发送前"而不是"唤醒前"：一回合要跑几十秒，唤醒时对方可能还没开始打字。
+  // 真正会撞车的是**消息落地那一刻**，所以闸门必须放在发送出口。
+  const PEER_TYPING_CFG = () => (cfg.socialV2?.peerTyping ?? {});
+  const peerTypingAt = new Map(); // key -> { at, eventType }
+
+  /** 记一次「对方正在打字」。非私聊、开关关掉、无 userId 都直接忽略。 */
+  function notePeerTyping(key, eventType) {
+    if (!key || !String(key).startsWith('private:')) return;
+    if (PEER_TYPING_CFG().enabled === false) return;
+    // 顺手清过期项：私聊对象会越攒越多，不清就是慢性内存泄漏。
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    for (const [k, v] of peerTypingAt) if (!v || v.at < cutoff) peerTypingAt.delete(k);
+    peerTypingAt.set(key, { at: Date.now(), eventType: Number(eventType) || 1 });
+  }
+
+  /** 还需要等多久（毫秒）。0 = 不用等。 */
+  function peerTypingRemainingMs(key) {
+    if (PEER_TYPING_CFG().enabled === false) return 0;
+    const t = peerTypingAt.get(key);
+    if (!t) return 0;
+    const c = PEER_TYPING_CFG();
+    const grace = t.eventType === 3
+      ? Math.max(0, Number(c.voiceGraceMs ?? 15000) || 0)
+      : Math.max(0, Number(c.graceMs ?? 6000) || 0);
+    return Math.max(0, t.at + grace - Date.now());
+  }
+
+  /**
+   * 发送前等对方打完字。返回实际等了多久（毫秒）。
+   * 分片轮询（≤500ms 一片）而不是一次睡到底：窗口期内对方可能又敲了两下，
+   * 一次性长睡会按旧时间戳醒过来，等于没顺延。
+   */
+  async function waitPeerTypingIdleV2(key) {
+    const startedAt = Date.now();
+    const cap = Math.max(0, Number(PEER_TYPING_CFG().maxWaitMs ?? 20000) || 0);
+    let waited = 0;
+    while (waited < cap) {
+      const need = peerTypingRemainingMs(key);
+      if (need <= 0) break;
+      const step = Math.min(need, 500, cap - waited);
+      if (step <= 0) break;
+      await sleep(step);
+      waited = Date.now() - startedAt;
+    }
+    if (waited >= 300) {
+      log(`[等对方] ${key} 对面还在打字，等了 ${(waited / 1000).toFixed(1)} 秒才开口`);
+    }
+    return waited;
+  }
+
   // 心情 → 在线状态。QQ 客户端语义：10 在线 / 30 离开 / 50 忙碌 / 60 Q我吧 / 70 请勿打扰。
   // 只改状态码，**不发**自定义状态文字：set_diy_online_status 需要一个合法 face_id，
   // 而这些 face_id 的取值空间没验证过，发错在好友列表里就是一条脏状态。
@@ -4868,11 +4931,13 @@ async function main() {
     normalizeReasoningEffort,
     normalizeSpeakerIdsV2,
     noteModelMessagesV2,
+    notePeerTyping,
     noteSleepGraceV2,
     oneBotCall,
     parseTargetKey,
     peakQuietCfgV2,
     peakWindowV2,
+    peerTypingRemainingMs,
     pending,
     pendingAskClaimsV2,
     pendingSendToolCalls,
@@ -5017,6 +5082,7 @@ async function main() {
     wakeConfigMissCount,
     wakeConfigUpdatedKeys,
     wakeFromSleepV2,
+    waitPeerTypingIdleV2,
     withTimeout,
     writeRoleContent,
     writeRoleState,
@@ -6155,6 +6221,11 @@ async function main() {
     // [并发] 每个会话一条出站链（保证「先文字后表情」「手滑撤回再重发」的顺序），
     // 会话之间并行；条间间隔一律放进队列任务里，否则下一条会抢在间隔结束前发出去。
     let last = Promise.resolve();
+    // [等对方说完] 对面刚还在打字 ⇒ 先别开口。作为队列的第一个任务，好处是：
+    // 只阻塞本会话（别的会话照发）、和后面的 firstDelay 自然叠加、
+    // 也不会打乱「手滑撤回再重发」的顺序。
+    // 入队前先判一次：不用等就别往队列里塞空任务。
+    if (peerTypingRemainingMs(key) > 0) last = sendQueueV2(key, () => waitPeerTypingIdleV2(key));
     if (firstDelay > 0) last = sendQueueV2(key, () => sleep(firstDelay));
     for (let i = 0; i < toSend.length; i++) {
       const msg = toSend[i];
@@ -6247,6 +6318,9 @@ async function main() {
       }
       return false;
     }
+    // [等对方说完] 自动转发这条路径也要让路，否则"工具发送"让了、"自动转发"照样抢话，
+    // 用户感觉到的还是抢话。群聊 remaining 恒 0，等于零开销。
+    if (peerTypingRemainingMs(key) > 0) await waitPeerTypingIdleV2(key);
     await sendToQQ(key, text);
     return true;
   }
@@ -12937,6 +13011,26 @@ async function main() {
   });
   bot.onNotice('notify', async (event) => {
     try { await handlePokeNotice(event); } catch (error) { log('处理拍一拍事件出错:', error?.message ?? error); }
+  });
+  // 「对方正在输入」：QQ 的 InputStatusNotify，SnowLuma 转成 notice/notify + sub_type=input_status。
+  // 这里**只记时间戳**，发送前由 waitPeerTypingIdleV2 读它决定要不要等；不碰消息流，
+  // 所以同步处理、不 await。单独注册（不复用上面那条）是为了出错时日志不串成"拍一拍"。
+  bot.onNotice('notify', (event) => {
+    try {
+      if (!event || event.sub_type !== 'input_status') return;
+      if (event.user_id == null) return;
+      // 自己发出去的 set_input_status 万一被回灌，别把它当成"对方在打字"。
+      if (event.self_id != null && String(event.user_id) === String(event.self_id)) return;
+      const key = `private:${event.user_id}`;
+      const before = peerTypingRemainingMs(key);
+      notePeerTyping(key, event.event_type);
+      // 只在"从没在打字变成在打字"时记一行：真打字了日志能看见，但也别每次敲键都刷屏。
+      if (before <= 0 && peerTypingRemainingMs(key) > 0) {
+        log(`[等对方] ${key} 对面开始打字${Number(event.event_type) === 3 ? '（语音）' : ''}`);
+      }
+    } catch (error) {
+      log('[等对方] 记录正在输入状态出错:', error?.message ?? error);
+    }
   });
   // 文件收发：监听文件类 notice（QQ 私聊发文件通常是 offline_file）。仅主人私聊处理，群聊一律忽略。
   bot.onNotice(async (event) => {

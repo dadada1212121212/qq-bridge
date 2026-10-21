@@ -152,6 +152,12 @@
       "maxBytes": 52428800,
       "inboxDir": ""
     },
+    "peerTyping": {
+      "enabled": true,
+      "graceMs": 6000,
+      "voiceGraceMs": 15000,
+      "maxWaitMs": 20000
+    },
     "biliStroll": {
       "enabled": false,
       "minHour": 14,

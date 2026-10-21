@@ -148,6 +148,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
   return {
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
+    sendMessagesV2,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     appendMemoryV2, formatMemoryV2,
     startTurnGame, playTurnGame, renderTurnGame, buildMusicShare, renderMusicShare, saveSocialV2State,
@@ -165,6 +166,8 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     v2TurnStartAt, sendToolSucceededSessions,
     // [patch 每轮新会话] 轮换判定 + 清占用（测试要手动模拟 turn/end 才能连发两次唤醒）。
     freshSessionBeforeWakeV2, lastContextTokensV2, pendingWakeKeys, disarmPendingWakeLease,
+    // [等对方说完] 对方正在打字的闸门：记状态 / 读剩余等待 / 真等待。
+    notePeerTyping, peerTypingRemainingMs, waitPeerTypingIdleV2, auditAndSend,
     resetEpoch() { sessionEpoch++; },
   };
   bot.onPrivateMessage(async (event) => {`);
