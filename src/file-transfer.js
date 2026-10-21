@@ -11,10 +11,11 @@
 //
 // deps 契约：
 //   oneBotCall(action, params)  必需，OneBot HTTP 调用
-//   cfg                       必需，配置对象（读 socialV2.files.maxBytes / inboxDir）
+//   cfg                       必需，配置对象（读 socialV2.files.enabled/maxBytes/inboxDir）
 //   ROOT                      必需，仓库根（相对路径解析 base）
 //   STATE_DIR                 必需，状态目录
 //   log                       可选，日志函数（缺省 noop）
+//   swallow(tag, err, detail) 可选，静默失败记账（缺省只打日志）——见 src/silent-failures.js
 
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -22,6 +23,22 @@ import path from 'node:path';
 import { localDayString } from './day-key.js';
 
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024; // 50MB
+// 索引超过这个行数就压缩一次（保留最近一半）。收件箱是"最近的有用"，历史全留没意义，
+// 而且 readIndex 每次要整文件 parse，行数越多越慢。
+const MAX_INDEX_ROWS = 2000;
+const ROTATE_CHECK_EVERY = 200;
+
+// 明确拒绝的收件目录：盘符根、Windows 系统目录。AI 有可能被用户话术带偏，
+// 「存到 C:\Windows\System32」这种不该照做。
+const FORBIDDEN_DIR_RE = new RegExp(
+  '^[A-Za-z]:[\\\\/]?(?:$'
+  + '|windows(?:[\\\\/]|$)'
+  + '|program files(?: \\(x86\\))?(?:[\\\\/]|$)'
+  + '|programdata(?:[\\\\/]|$)'
+  + '|system volume information(?:[\\\\/]|$)'
+  + ')',
+  'i'
+);
 
 function noop() {}
 
@@ -46,6 +63,9 @@ function nextSeq() {
 function isAbsWinDir(s) {
   return /^[A-Za-z]:[\\/]/.test(String(s || '').trim());
 }
+function isForbiddenDir(s) {
+  return FORBIDDEN_DIR_RE.test(String(s || '').trim());
+}
 function readTransferState(file) {
   try {
     if (!fs.existsSync(file)) return {};
@@ -56,7 +76,30 @@ function writeTransferState(file, obj) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(obj, null, 2));
-  } catch {}
+    return true;
+  } catch { return false; }
+}
+
+// file:// 引用 → Windows 本地路径（用于发送前 stat 大小）。
+// 同时认 WSL 风格 `file:///mnt/d/x` 和直写盘符 `file:///D:/x`。认不出返回 null。
+function refToLocalPath(ref) {
+  const s = String(ref || '');
+  const wsl = /^file:\/\/\/mnt\/([a-z])\/(.*)$/i.exec(s);
+  if (wsl) return `${wsl[1].toUpperCase()}:/${wsl[2]}`;
+  const win = /^file:\/\/\/([A-Za-z]:\/.*)$/.exec(s);
+  if (win) return win[1];
+  return null;
+}
+
+// 从用户/AI 给的 filePath 推出本地真实路径（拿不到就 null：base64、http、无法映射的 file://）。
+function resolveLocalFile(raw, ROOT) {
+  const s = String(raw ?? '').trim();
+  if (!s || /^(https?:|base64:)/i.test(s)) return null;
+  if (/^file:\/\//i.test(s)) {
+    const p = refToLocalPath(s);
+    return p ? path.resolve(p) : null;
+  }
+  return path.isAbsolute(s) ? s : path.resolve(ROOT, s);
 }
 
 // Windows 绝对路径 → WSL 文件引用（与 bridge.js qzoneImageRef 同构）。
@@ -92,17 +135,22 @@ function sanitizeName(name) {
   return s;
 }
 
-// 避免同目录重名：name → name(1) → name(2) ...
-async function uniquePath(dir, name) {
-  const base = path.join(dir, name);
-  if (!fs.existsSync(base)) return base;
+// 原子地占一个不重名的文件句柄：name → name(1) → name(2) ...
+//
+// 不能用「先 existsSync 再写」：两个同名文件几乎同时到达时，两次检查都会说"不存在"，
+// 于是抢到同一个路径互相覆盖。用 `wx`（独占创建）让文件系统来裁决，EEXIST 就换下一个名字。
+async function openUnique(dir, name) {
   const ext = path.extname(name);
   const stem = ext ? name.slice(0, -ext.length) : name;
-  for (let i = 1; i < 10000; i++) {
-    const cand = path.join(dir, `${stem}(${i})${ext}`);
-    if (!fs.existsSync(cand)) return cand;
+  for (let i = 0; i < 10000; i++) {
+    const cand = path.join(dir, i ? `${stem}(${i})${ext}` : name);
+    try {
+      return { path: cand, fh: await fsp.open(cand, 'wx') };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
   }
-  return path.join(dir, `${name}.${Date.now()}`);
+  throw new Error('无法分配唯一文件名：' + name);
 }
 
 // 取第一个非空字符串（去空白）。用于抹平各家 OneBot 实现的字段命名差异。
@@ -165,55 +213,118 @@ function parseNotice(e) {
   };
 }
 
-async function downloadFile(p, oneBotCall) {
-  // ① 事件自带直链（offline_file 基本都有）——直接用。
-  let url = /^https?:/i.test(p.url || '') ? p.url : null;
-  if (!url) {
-    if (p.kind === 'private') {
-      const r = await oneBotCall('get_private_file_url', {
-        user_id: Number(p.fromQQ),
-        file_id: p.fileId,
-        file_hash: p.fileHash,
-      }).catch(() => null);
-      url = r?.url || r?.file_url || null;
-    } else {
-      const r = await oneBotCall('get_group_file_url', {
-        group_id: Number(p.fromQQ),
-        file_id: p.fileId,
-        busid: p.busid,
-      }).catch(() => null);
-      url = r?.url || r?.file_url || null;
+// 拿到下载直链（或 base64 兜底）。事件自带 url 时直接用，省一次 API 往返。
+async function resolveDownload(p, oneBotCall) {
+  if (/^https?:/i.test(p.url || '')) return { url: p.url };
+  if (p.kind === 'private') {
+    const r = await oneBotCall('get_private_file_url', {
+      user_id: Number(p.fromQQ),
+      file_id: p.fileId,
+      file_hash: p.fileHash,
+    }).catch(() => null);
+    if (r?.url || r?.file_url) return { url: r.url || r.file_url };
+  } else {
+    const r = await oneBotCall('get_group_file_url', {
+      group_id: Number(p.fromQQ),
+      file_id: p.fileId,
+      busid: p.busid,
+    }).catch(() => null);
+    if (r?.url || r?.file_url) return { url: r.url || r.file_url };
+  }
+  // 兜底：OneBot 通用媒体下载，可能直接返回 base64。
+  const g = await oneBotCall('get_file', { file_id: p.fileId }).catch(() => null);
+  if (g?.base64) return { base64: g.base64 };
+  if (g?.url) return { url: g.url };
+  return {};
+}
+
+// 下载并写入已打开的句柄（调用方负责关闭），**边下边写、边计数**，超限立刻中止。
+//
+// 为什么必须这样：原来是 `Buffer.from(await res.arrayBuffer())` 全量进内存，
+// 对方发个 2GB 文件就能把桥接进程直接 OOM 掉（发送侧有 maxBytes，接收侧却一点不设防）。
+// 先看 Content-Length 能省掉大部分无效下载；流式计数兜住"没给长度"或"长度撒谎"的情况。
+async function downloadToFile(p, oneBotCall, fh, limitBytes) {
+  const got = await resolveDownload(p, oneBotCall);
+  if (got.base64) {
+    const buf = Buffer.from(got.base64, 'base64');
+    if (buf.length > limitBytes) {
+      throw new Error(`文件过大（${formatBytes(buf.length)} > ${formatBytes(limitBytes)}），已放弃接收`);
+    }
+    await fh.write(buf);
+    return { bytes: buf.length };
+  }
+  if (!got.url) {
+    throw new Error('无法获取文件下载 URL（事件未带 url，且 get_*_file_url / get_file 都没返回）');
+  }
+  const res = await fetch(got.url, { signal: AbortSignal.timeout(120000) });
+  if (!res.ok) throw new Error('下载 HTTP ' + res.status);
+  const declared = Number(res.headers.get('content-length') || 0);
+  if (declared > limitBytes) {
+    try { await res.body?.cancel(); } catch { /* 已放弃，取消失败无所谓 */ }
+    throw new Error(`文件过大（${formatBytes(declared)} > ${formatBytes(limitBytes)}），已放弃接收`);
+  }
+  let written = 0;
+  if (res.body) {
+    for await (const chunk of res.body) {
+      written += chunk.length;
+      if (written > limitBytes) {
+        throw new Error(`文件过大（已超过 ${formatBytes(limitBytes)}），下载中止`);
+      }
+      await fh.write(chunk);
     }
   }
-  if (!url && p.fileId) {
-    // ② 兜底：OneBot 通用媒体下载，可能直接返回 base64。
-    const g = await oneBotCall('get_file', { file_id: p.fileId }).catch(() => null);
-    if (g?.base64) return Buffer.from(g.base64, 'base64');
-    if (g?.url) url = g.url;
-  }
-  if (!url) throw new Error('无法获取文件下载 URL（事件未带 url，且 get_*_file_url / get_file 都没返回）');
-  const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
-  if (!res.ok) throw new Error('下载 HTTP ' + res.status);
-  return Buffer.from(await res.arrayBuffer());
+  return { bytes: written };
 }
+
+// 索引缓存：按 mtime + size 失效。listInbox / readInboxText / 去重判断都要读它，
+// 每次都整文件 parse 太浪费（收件箱是高频查询）。
+let indexCache = { file: '', mtimeMs: -1, size: -1, rows: [] };
 
 function readIndex(stateDir) {
   const f = path.join(stateDir, 'files', 'inbox-index.jsonl');
-  if (!fs.existsSync(f)) return [];
+  let st;
+  try { st = fs.statSync(f); } catch {
+    indexCache = { file: f, mtimeMs: -1, size: -1, rows: [] };
+    return [];
+  }
+  if (indexCache.file === f && indexCache.mtimeMs === st.mtimeMs && indexCache.size === st.size) {
+    return indexCache.rows;
+  }
+  let rows = [];
   try {
-    return fs.readFileSync(f, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean)
+    rows = fs.readFileSync(f, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean)
       .map((l) => { try { return JSON.parse(l); } catch { return null; } })
       .filter(Boolean);
-  } catch { return []; }
+  } catch { rows = []; }
+  indexCache = { file: f, mtimeMs: st.mtimeMs, size: st.size, rows };
+  return rows;
 }
 
+// 索引压缩：超过 MAX_INDEX_ROWS 就只留最近一半，防止无限增长。
+// 用 tmp + rename 原子替换，中途崩了也不会留下半个文件。
+function maybeRotateIndex(f) {
+  let lines;
+  try { lines = fs.readFileSync(f, 'utf8').split('\n').filter((l) => l.trim()); } catch { return false; }
+  if (lines.length <= MAX_INDEX_ROWS) return false;
+  const keep = lines.slice(-Math.floor(MAX_INDEX_ROWS / 2));
+  try {
+    const tmp = f + '.tmp';
+    fs.writeFileSync(tmp, keep.join('\n') + '\n');
+    fs.renameSync(tmp, f);
+    indexCache = { file: '', mtimeMs: -1, size: -1, rows: [] }; // 强制下次重读
+    return true;
+  } catch { return false; }
+}
+
+let appendCount = 0;
 function appendIndex(stateDir, entry) {
   const dir = path.join(stateDir, 'files');
   fs.mkdirSync(dir, { recursive: true });
   const f = path.join(dir, 'inbox-index.jsonl');
   const seq = nextSeq();
-  const line = JSON.stringify({ seq, ...entry });
-  fs.appendFileSync(f, line + '\n');
+  fs.appendFileSync(f, JSON.stringify({ seq, ...entry }) + '\n');
+  // 压缩检查不能每次都做（要整文件读），每 ROTATE_CHECK_EVERY 次才看一遍。
+  if (++appendCount % ROTATE_CHECK_EVERY === 0) maybeRotateIndex(f);
   return seq;
 }
 
@@ -224,6 +335,10 @@ export function createFileTransfer(deps) {
   const ROOT = deps.ROOT || process.cwd();
   const STATE_DIR = deps.STATE_DIR || ROOT;
   const log = typeof deps.log === 'function' ? deps.log : noop;
+  // 吞异常一律走记账（仓库约定：别用裸 catch {}，否则"静默失败"查不到痕迹）。
+  const swallow = typeof deps.swallow === 'function'
+    ? deps.swallow
+    : (tag, error, detail) => { try { log(`[静默失败] ${tag}${detail ? '：' + detail : ''}：${error?.message ?? error}`); } catch { /* 日志本身失败无所谓 */ } };
 
   const maxBytes = () => Number(cfg?.socialV2?.files?.maxBytes) || DEFAULT_MAX_BYTES;
 
@@ -247,15 +362,22 @@ export function createFileTransfer(deps) {
     const st = readTransferState(TRANSFER_STATE);
     if (!dir) {
       delete st.inboxDir;
-      writeTransferState(TRANSFER_STATE, st);
+      if (!writeTransferState(TRANSFER_STATE, st)) {
+        throw new Error('清除收件目录失败：状态文件写不进去（' + TRANSFER_STATE + '）');
+      }
       return { ok: true, cleared: true, inboxDir: resolveInboxDir().dir };
     }
     if (!isAbsWinDir(dir)) {
       throw new Error('收件目录必须是 Windows 绝对路径，例如 D:/我的文件（不支持相对路径或网络路径）');
     }
+    if (isForbiddenDir(dir)) {
+      throw new Error('拒绝把收件目录设为系统目录（盘符根 / Windows / Program Files / ProgramData）：' + dir);
+    }
     const abs = path.resolve(String(dir).trim());
     st.inboxDir = abs;
-    writeTransferState(TRANSFER_STATE, st);
+    if (!writeTransferState(TRANSFER_STATE, st)) {
+      throw new Error('设置收件目录失败：状态文件写不进去（' + TRANSFER_STATE + '）');
+    }
     return { ok: true, inboxDir: abs };
   }
 
@@ -271,13 +393,15 @@ export function createFileTransfer(deps) {
     const kind = m[1];
     const id = m[2];
     const ref = winPathToWslRef(filePath, ROOT); // 抛错：不存在/非法
+    // 大小检查要覆盖 file:// 引用：原来只看"非 file://"的路径，等于给了个绕过口子。
     let size = 0;
-    const lowerRaw = String(filePath).trim().toLowerCase();
-    if (!/^(https?:|base64:|file:\/\/)/i.test(lowerRaw)) {
-      try {
-        const abs = path.isAbsolute(filePath) ? filePath : path.resolve(ROOT, filePath);
-        size = fs.statSync(abs).size;
-      } catch {}
+    const local = resolveLocalFile(filePath, ROOT);
+    if (local) {
+      try { size = fs.statSync(local).size; }
+      catch (error) {
+        if (/^file:\/\//i.test(String(filePath))) throw new Error('找不到文件：' + local);
+        swallow('文件发送-stat', error, local);
+      }
     }
     const limit = maxBytes();
     if (size > limit) throw new Error(`文件过大（${formatBytes(size)} > ${formatBytes(limit)}），已拒绝发送`);
@@ -292,7 +416,7 @@ export function createFileTransfer(deps) {
   }
 
   // ── 接收文件 ────────────────────────────────────────────────────────────
-  // 返回 { ok, savedPath, meta } 或 { ok:false, reason, dumped }
+  // 返回 { ok, savedPath, meta } / { ok:true, duplicate:true } / { ok:false, reason, dumped }
   async function handleFileNotice(event) {
     const parsed = parseNotice(event);
     const { dir: baseDir, withDate } = resolveInboxDir();
@@ -300,42 +424,62 @@ export function createFileTransfer(deps) {
     fs.mkdirSync(dir, { recursive: true });
     if (!parsed || !parsed.fileId) {
       const dump = path.join(dir, `${Date.now()}.unknown-event.json`);
-      await fsp.writeFile(dump, JSON.stringify(event, null, 2)).catch(() => {});
+      await fsp.writeFile(dump, JSON.stringify(event, null, 2)).catch((error) => swallow('文件接收-dump', error, dump));
       log('[文件] 收到无法识别的文件类 notice，已 dump 原始事件到 ' + dump);
       return { ok: false, reason: 'unrecognized-notice', dumped: dump };
     }
-    let buf = null;
-    let downloadErr = null;
-    try { buf = await downloadFile(parsed, oneBotCall); }
-    catch (e) { downloadErr = e?.message ?? String(e); log('[文件] 下载失败：' + downloadErr); }
+    // 幂等：同一个 fileId 只收一次。重连补拉 / 上游重复投递都会把同一个 notice 再送一遍，
+    // 不去重就会重复下载、落成 "报告(1).pdf" 这种垃圾。
+    const prev = readIndex(STATE_DIR).find((r) => r.fileId === parsed.fileId);
+    if (prev) {
+      log(`[文件] 跳过重复投递：${parsed.fileId}（已在 ${prev.savedPath}）`);
+      return { ok: true, duplicate: true, savedPath: prev.savedPath, meta: { seq: prev.seq, name: prev.name } };
+    }
 
     const safeName = sanitizeName(parsed.name || 'file');
-    let finalPath = await uniquePath(dir, safeName);
-    if (buf && buf.length) {
-      await fsp.writeFile(finalPath, buf);
-    } else {
-      // 下载失败：仍落盘元信息，便于事后用 file_id 重试。
-      finalPath = finalPath + '.download-failed';
-      await fsp.writeFile(finalPath, JSON.stringify({ ...parsed, downloadErr }, null, 2)).catch(() => {});
+    // 先用 `wx` 独占占位，再往里写：并发同名文件不会抢到同一路径。
+    const { path: finalPath, fh } = await openUnique(dir, safeName);
+    const limit = maxBytes();
+    let downloaded = false;
+    let bytes = 0;
+    let downloadErr = null;
+    try {
+      const r = await downloadToFile(parsed, oneBotCall, fh, limit);
+      downloaded = true;
+      bytes = r.bytes;
+    } catch (error) {
+      downloadErr = error?.message ?? String(error);
+      swallow('文件接收', error, parsed.fileId);
+    } finally {
+      await fh.close().catch((error2) => swallow('文件接收-关闭句柄', error2, finalPath));
+    }
+    let savedPath = finalPath;
+    if (!downloaded) {
+      // 中途超限/中断会留下半个文件，必须删掉，否则占着这个名字。
+      try { fs.unlinkSync(finalPath); } catch (error2) { swallow('文件接收-清理残留', error2, finalPath); }
+      // 仍落盘元信息，便于事后用 file_id 重试。
+      savedPath = finalPath + '.download-failed';
+      await fsp.writeFile(savedPath, JSON.stringify({ ...parsed, downloadErr }, null, 2))
+        .catch((error2) => swallow('文件接收-写失败元信息', error2, savedPath));
     }
     const seq = appendIndex(STATE_DIR, {
       receivedAt: new Date().toISOString(),
       fromKey: parsed.fromKey,
       fromQQ: parsed.fromQQ,
       name: safeName,
-      size: parsed.size || (buf ? buf.length : 0),
-      savedPath: finalPath,
+      size: parsed.size || bytes,
+      savedPath,
       fileId: parsed.fileId,
       fileHash: parsed.fileHash,
       kind: parsed.kind,
       noticeType: parsed.noticeType,
-      downloaded: !!buf,
+      downloaded,
       ...(downloadErr ? { downloadErr } : {}),
     });
     return {
       ok: true,
-      savedPath: finalPath,
-      meta: { seq, name: safeName, size: parsed.size, downloaded: !!buf },
+      savedPath,
+      meta: { seq, name: safeName, size: parsed.size || bytes, downloaded },
     };
   }
 

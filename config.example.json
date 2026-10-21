@@ -147,6 +147,11 @@
       "diary": true,
       "moodLog": true
     },
+    "files": {
+      "enabled": true,
+      "maxBytes": 52428800,
+      "inboxDir": ""
+    },
     "wake": {
       "catchUpMaxAgeMs": 900000,
       "defaultMode": "diving",

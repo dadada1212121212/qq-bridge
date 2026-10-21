@@ -4663,11 +4663,17 @@ async function main() {
   // ── 文件收发 ──────────────────────────────────────────────────────────────
   // 底层能力在 src/file-transfer.js：发送用 OneBot upload_private_file / upload_group_file，
   // 接收用 onNotice 把文件类事件交给 handleFileNoticeEvent，仅主人私聊处理。
-  const fileTransfer = createFileTransfer({ oneBotCall, cfg, ROOT, STATE_DIR, log });
+  const fileTransfer = createFileTransfer({
+    oneBotCall, cfg, ROOT, STATE_DIR, log,
+    // 延迟求值：swallowV2 是 const、声明在 main() 很靠后（TDZ），这里只能包一层箭头函数。
+    swallow: (tag, error, detail) => swallowV2(tag, error, detail),
+  });
   async function handleFileNoticeEvent(event) {
     if (!event || typeof event !== 'object') return;
     const t = event.notice_type || '';
-    const looksLikeFile = t === 'offline_file' || t === 'group_upload' || t === 'private_upload' || !!(event.file_id || event.fileId);
+    // 真实报文把文件字段嵌在 `file` 里，顶层未必有 file_id，所以 `file` 本身也算特征。
+    const looksLikeFile = t === 'offline_file' || t === 'group_upload' || t === 'private_upload'
+      || !!event.file || !!(event.file_id || event.fileId);
     if (!looksLikeFile) return;
     const fromKey = event.group_id ? `group:${event.group_id}` : (event.user_id ? `private:${event.user_id}` : '');
     const ownerKey = `private:${String(cfg.ownerQQ ?? '')}`;
@@ -4677,7 +4683,10 @@ async function main() {
     }
     try {
       const res = await fileTransfer.handleFileNotice(event);
-      if (res?.ok) {
+      if (res?.duplicate) {
+        // 重连补拉 / 上游重复投递：同一个 fileId 只收一次，别重复记账也别重复提示。
+        log(`[文件] 重复投递已忽略：${res.meta?.name || '未知'}（${res.savedPath}）`);
+      } else if (res?.ok) {
         log(`[文件] 收到主人文件 → ${res.savedPath}`);
         appendActivity(`收到文件：${res.meta?.name || '未知'}（${res.savedPath}）`);
       } else {

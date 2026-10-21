@@ -219,20 +219,98 @@ function ok(name, cond, extra = '') {
     ok('file 为字符串时按 id 取链', seen?.file_id === 'str-id-1' && r.meta.downloaded === true);
   }
 
-  // 9e. 同一毫秒连收两个：seq 必须严格递增（否则按 seq 取件会取错）
+  // 9e. 同一毫秒连收三个：seq 必须严格递增（否则按 seq 取件会取错）
+  // ⚠️ 必须用**不同** fileId：相同 fileId 会被幂等逻辑判成重复投递（见 10b），返回的还是旧 seq。
   {
     const ft = createFileTransfer({
       oneBotCall: async () => ({ base64: Buffer.from('x').toString('base64') }),
       cfg: {}, ROOT: tmp, STATE_DIR: STATE, log: () => {},
     });
-    const ev = { notice_type: 'offline_file', user_id: 3796180411, file: { id: 'S', name: 's.txt', url: dlUrl } };
-    const a = await ft.handleFileNotice(ev);
-    const b = await ft.handleFileNotice(ev);
-    const c = await ft.handleFileNotice(ev);
+    const mk = (id) => ({ notice_type: 'offline_file', user_id: 3796180411, file: { id, name: 's.txt', url: dlUrl } });
+    const a = await ft.handleFileNotice(mk('SEQ-A'));
+    const b = await ft.handleFileNotice(mk('SEQ-B'));
+    const c = await ft.handleFileNotice(mk('SEQ-C'));
     ok('连收三份 seq 严格递增', a.meta.seq < b.meta.seq && b.meta.seq < c.meta.seq, `${a.meta.seq}/${b.meta.seq}/${c.meta.seq}`);
   }
 
   server.close();
+}
+
+// 10. 质量加固（2026-10-21）：接收侧限额 / 幂等 / 系统目录保护 / file:// 限额 / 吞异常记账
+{
+  // 10a. 接收超限：Content-Length 已经超了 → 写盘前就拒绝，不留半个文件
+  {
+    const BIG = Buffer.alloc(4096, 0x61);
+    const srv = http.createServer((req, res) => { res.writeHead(200, { 'Content-Length': String(BIG.length) }); res.end(BIG); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const u = `http://127.0.0.1:${srv.address().port}/big`;
+    const ft = createFileTransfer({
+      oneBotCall: async () => ({}),
+      cfg: { socialV2: { files: { maxBytes: 1024 } } }, // 1KB 上限，文件 4KB
+      ROOT: tmp, STATE_DIR: STATE, log: () => {},
+    });
+    const r = await ft.handleFileNotice({ notice_type: 'offline_file', user_id: 3796180411, file: { id: 'BIG1', name: 'big.bin', url: u } });
+    ok('超限文件不被标记为已下载', r.meta.downloaded === false);
+    ok('超限落成 .download-failed 元信息', r.savedPath.endsWith('.download-failed'));
+    ok('超限不留半截文件', !fs.existsSync(r.savedPath.replace(/\.download-failed$/, '')));
+    srv.close();
+  }
+
+  // 10b. 幂等：同一个 fileId 投两次，只落一份
+  {
+    const srv = http.createServer((req, res) => { res.writeHead(200); res.end('once'); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const u = `http://127.0.0.1:${srv.address().port}/x`;
+    const ft = createFileTransfer({ oneBotCall: async () => ({}), cfg: {}, ROOT: tmp, STATE_DIR: STATE, log: () => {} });
+    const ev = { notice_type: 'offline_file', user_id: 3796180411, file: { id: 'DUP-1', name: 'dup.txt', url: u } };
+    const a = await ft.handleFileNotice(ev);
+    const b = await ft.handleFileNotice(ev);
+    ok('首次接收正常', a.ok === true && a.meta.downloaded === true);
+    ok('重复投递被识别为 duplicate', b.ok === true && b.duplicate === true);
+    ok('重复投递返回原路径（不新建文件）', b.savedPath === a.savedPath);
+    const rows = ft.listInbox(200).items.filter((x) => x.fileId === 'DUP-1');
+    ok('索引里只有一条 DUP-1', rows.length === 1, 'count=' + rows.length);
+    srv.close();
+  }
+
+  // 10c. 收件目录保护：拒绝系统目录
+  {
+    const ft = createFileTransfer({ oneBotCall: async () => ({}), cfg: {}, ROOT: tmp, STATE_DIR: STATE, log: () => {} });
+    const bad = ['C:\\', 'D:/', 'C:\\Windows', 'C:\\Windows\\System32', 'C:\\Program Files', 'C:\\ProgramData'];
+    let rejected = 0;
+    for (const d of bad) { try { ft.setInboxDir(d); } catch { rejected++; } }
+    ok('系统目录全部被拒绝', rejected === bad.length, `${rejected}/${bad.length}`);
+    // 正常用户目录仍然可以设
+    const goodDir = path.join(tmp, 'ok-dir');
+    let okGood = false;
+    try { okGood = ft.setInboxDir(goodDir).ok === true; } catch { okGood = false; }
+    ok('普通目录仍可设置', okGood);
+    ft.setInboxDir(''); // 复位
+  }
+
+  // 10d. file:// 引用也要过大小检查（原来只有非 file:// 才检查，等于留了绕过口子）
+  {
+    const big = path.join(tmp, 'huge.bin');
+    fs.writeFileSync(big, Buffer.alloc(5000, 0x62));
+    const ref = 'file:///mnt/' + big.replace(/^([A-Za-z]):[\\/]/, (_, d) => d.toLowerCase() + '/').replace(/\\/g, '/');
+    const ft = createFileTransfer({ oneBotCall: async () => ({}), cfg: { socialV2: { files: { maxBytes: 1024 } } }, ROOT: tmp, STATE_DIR: STATE, log: () => {} });
+    let threw = null;
+    try { await ft.sendFile({ key: 'private:1', filePath: ref }); } catch (e) { threw = e?.message || String(e); }
+    ok('file:// 引用超限被拒', typeof threw === 'string' && threw.includes('过大'), threw || '未抛错');
+  }
+
+  // 10e. 吞异常要走记账（注入的 swallow 必须真的被调用）
+  {
+    const tags = [];
+    const ft = createFileTransfer({
+      oneBotCall: async () => ({}),
+      cfg: { socialV2: { files: { maxBytes: 1024 } } },
+      ROOT: tmp, STATE_DIR: STATE, log: () => {},
+      swallow: (tag) => tags.push(tag),
+    });
+    await ft.handleFileNotice({ notice_type: 'offline_file', user_id: 3796180411, file: { id: 'SW-1', name: 'sw.bin', url: 'http://127.0.0.1:1/none' } });
+    ok('下载失败走 swallow 记账', tags.includes('文件接收'), tags.join(','));
+  }
 }
 
 console.log(`\n结果：${pass} 通过, ${fail} 失败`);
