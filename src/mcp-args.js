@@ -44,6 +44,61 @@ export function normEnum(value, aliasMap) {
 }
 
 /**
+ * 把「别名键」折叠成规范键，并把**认不出的键**原样报出来。
+ *
+ * 为什么需要：zod 的 object 默认丢弃未声明的键。于是模型传
+ * `triggers: { at: true, name: true }`（该写 atMention / nameMention）时，
+ * 三个设置被静默吞掉，工具照样返回 ok:true —— 她以为设上了，实际一项没生效。
+ * 这比报错糟得多：错可以重试，静默成功会一直错下去。
+ *
+ * 用法：schema 上加 .passthrough() 让多余的键活着进来，再在这里折叠 + 报告。
+ * @returns {{ value: object, dropped: string[] }} dropped = 折叠后仍不认识的键
+ */
+export function foldAliases(obj, aliasMap) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return { value: obj, dropped: [] };
+  const out = { ...obj };
+  const canonical = new Set(Object.keys(aliasMap));
+  const lowerToReal = new Map(Object.keys(out).map((k) => [k.toLowerCase(), k]));
+  for (const [name, aliases] of Object.entries(aliasMap)) {
+    if (out[name] !== undefined) continue;
+    for (const alias of aliases) {
+      const real = lowerToReal.get(alias.toLowerCase());
+      if (!real || real === name || out[real] === undefined) continue;
+      out[name] = out[real];
+      delete out[real];
+      lowerToReal.delete(real.toLowerCase());
+      break;
+    }
+  }
+  const dropped = Object.keys(out).filter((k) => !canonical.has(k));
+  // 认不出的键一并删掉再转发：写配置的接口不该把模型瞎编的字段存进 state。
+  // 它们已经在 dropped 里被报出来了，不会变成"静默失效"。
+  for (const k of dropped) delete out[k];
+  return { value: out, dropped };
+}
+
+/** 统一成字符串数组：接受数组、"a,b"、"a，b"、"a、b"、"a b"。 */
+export function asArray(v) {
+  if (Array.isArray(v)) return v.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim());
+  if (typeof v === 'string') return v.split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean);
+  return [];
+}
+
+/**
+ * 取「一条或多条消息」参数：字符串原样返回，数组原样返回。
+ * 刻意**不**用 asArray 拆空格——那会把「我今天有点累 想早点睡」拆成两条消息发出去。
+ */
+export function pickStrOrList(args, names) {
+  if (!args || typeof args !== 'object') return undefined;
+  for (const n of names) {
+    const v = args[n];
+    if (typeof v === 'string' && v.trim()) return v;
+    if (Array.isArray(v) && v.some((x) => typeof x === 'string' && x.trim())) return v;
+  }
+  return undefined;
+}
+
+/**
  * 给 zod shape 补一组「别名参数」（全部可选、不带描述，避免多占 token）。
  * zod 由调用方传进来，本模块不依赖 zod。
  * 用法：{ query: z.string().optional().describe('...'), ...aliasFields(z, ['query', 'keyword'], 'query') }

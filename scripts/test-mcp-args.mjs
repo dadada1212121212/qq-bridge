@@ -11,9 +11,11 @@
 // 注意：凡是"会真的发出去"的调用一律不测（发评论/发消息），只用
 // 「缺必填项 ⇒ 在本地就被拦下」和「无效令牌 ⇒ 走到桥接才失败」这两类路径。
 import { spawn } from 'node:child_process';
+import http from 'node:http';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pickStr, argNames, missingArgHint, normEnum, aliasFields } from '../src/mcp-args.js';
+import { pickStr, argNames, missingArgHint, normEnum, aliasFields, foldAliases, asArray, pickStrOrList } from '../src/mcp-args.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 let pass = 0;
@@ -63,6 +65,39 @@ console.log('## aliasFields：别名都声明成可选');
   t('含 keyword / q', Object.hasOwn(f, 'keyword') && Object.hasOwn(f, 'q'));
 }
 
+console.log('## foldAliases：别名折叠 + 认不出的键要报出来');
+{
+  const map = { atMention: ['at', 'mention'], nameMention: ['name'], keywords: ['keyword'] };
+  const r = foldAliases({ at: true, name: false, keyword: '鲸鱼' }, map);
+  t('at → atMention', r.value.atMention === true);
+  t('name → nameMention（false 也要折叠，不能当没传）', r.value.nameMention === false);
+  t('keyword → keywords', r.value.keywords === '鲸鱼');
+  t('别名键被删掉，不会转发给桥接', !('at' in r.value) && !('name' in r.value) && !('keyword' in r.value));
+  t('没有多余键时不报警', r.dropped.length === 0, r.dropped.join(','));
+
+  const bad = foldAliases({ at: true, zzz: 1, yyy: 2 }, map);
+  t('认不出的键被列出来（这就是"静默失效"的解药）', bad.dropped.join(',') === 'zzz,yyy', bad.dropped.join(','));
+
+  const both = foldAliases({ atMention: false, at: true }, map);
+  t('规范名优先，别名不覆盖它', both.value.atMention === false);
+
+  t('非对象不炸', foldAliases(null, map).value === null);
+}
+
+console.log('## asArray / pickStrOrList：关键词可拆，消息不能拆');
+{
+  t('数组原样', asArray(['a', 'b']).join('|') === 'a|b');
+  t('逗号串拆分', asArray('大肥鱼,本鲸').join('|') === '大肥鱼|本鲸');
+  t('中文逗号也拆', asArray('大肥鱼，本鲸').length === 2);
+  t('空格也拆', asArray('a b').length === 2);
+
+  // 消息绝不能按空格拆：一句话被拆成两条发出去是事故。
+  t('消息字符串原样保留', pickStrOrList({ messages: '我今天有点累 想早点睡' }, ['messages']) === '我今天有点累 想早点睡');
+  t('消息别名回退', pickStrOrList({ message: '在' }, ['messages', 'message']) === '在');
+  t('消息数组原样', Array.isArray(pickStrOrList({ messages: ['一', '二'] }, ['messages'])));
+  t('全空返回 undefined', pickStrOrList({ messages: '   ' }, ['messages']) === undefined);
+}
+
 // ── 真实 MCP 协议：别名必须过 zod ────────────────────────────────────────────
 console.log('## bili_post_comment：只传 bvid（别名）也要过校验');
 {
@@ -93,13 +128,66 @@ console.log('## qq_set_wake_config：mode 传 silent 也要过校验');
   t('走到了桥接（说明 schema 收下了 silent）', /设置唤醒配置失败/.test(r.text), r.text.slice(0, 80));
 }
 
+console.log('## qq_send_message：messages 写成 message 也要能发');
+{
+  // token 给个假的（48 位）：能过 schema，桥接会以"未授权"拒绝，不会真的发出去。
+  const r = await callTool(path.join(ROOT, 'src', 'mcp-snowluma-safe.js'), 'qq_send_message', { key: 'private:1', token: 'x'.repeat(48), message: '在' });
+  t('没有 zod 校验错误', !/Input validation error/.test(r.text) && !r.error, (r.error || r.text).slice(0, 90));
+  t('没报 messages 缺失', !/缺少 messages/.test(r.text), r.text.slice(0, 60));
+  t('走到了桥接（说明 message 别名被认下）', /发送失败/.test(r.text), r.text.slice(0, 60));
+}
+
+console.log('## 端到端：别名折叠后转发给桥接，认不出的字段要明说');
+{
+  const requests = [];
+  const api = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    requests.push({ url: req.url, body: raw ? JSON.parse(raw) : null });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, key: 'private:1', wakeConfig: { mode: 'diving', triggers: { atMention: true } } }));
+  });
+  await new Promise((resolve, reject) => {
+    api.once('error', reject);
+    api.listen(0, '127.0.0.1', resolve);
+  });
+  let fixture = null;
+  try {
+    fixture = await fs.promises.mkdtemp(path.join(ROOT, '.tmp-mcp-args-test-'));
+    await fs.promises.mkdir(path.join(fixture, 'src'));
+    await Promise.all(['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js', 'mcp-args.js'].map((name) =>
+      fs.promises.copyFile(path.join(ROOT, 'src', name), path.join(fixture, 'src', name))));
+    await fs.promises.writeFile(path.join(fixture, 'config.json'), JSON.stringify({ consolePort: api.address().port }));
+
+    const r = await callTool(path.join(fixture, 'src', 'mcp-snowluma-safe.js'), 'qq_set_wake_config', {
+      key: 'private:1',
+      token: 'fixture-token',
+      config: { mode: 'silent', triggers: { at: true, name: true, keyword: '大肥鱼,本鲸', zzz: 1 } },
+    }, fixture);
+
+    const body = requests.at(-1)?.body || {};
+    const tr = body.config?.triggers || {};
+    t('打到了桥接', requests.length === 1, String(requests.length));
+    t('mode 归一成 diving', body.config?.mode === 'diving', String(body.config?.mode));
+    t('at → atMention', tr.atMention === true);
+    t('name → nameMention', tr.nameMention === true);
+    t('keyword 字符串拆成数组', Array.isArray(tr.keywords) && tr.keywords.join('|') === '大肥鱼|本鲸', JSON.stringify(tr.keywords));
+    t('别名键没有转发出去', !('at' in tr) && !('name' in tr) && !('keyword' in tr));
+    t('认不出的 zzz 没有转发', !('zzz' in tr));
+    t('响应里明确说了 zzz 没生效（不许静默成功）', /zzz/.test(r.text) && /没生效/.test(r.text), r.text.slice(-120));
+  } finally {
+    await new Promise((resolve) => api.close(resolve));
+    if (fixture) await fs.promises.rm(fixture, { recursive: true, force: true });
+  }
+}
+
 console.log('\n参数容错：' + pass + ' 通过 / ' + fail + ' 失败');
 if (fail) process.exit(1);
 
 /** 起一个 MCP 子进程，走 stdio JSON-RPC 调一个工具。 */
-function callTool(entry, name, args) {
+function callTool(entry, name, args, cwd = ROOT) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [entry], { stdio: ['pipe', 'pipe', 'pipe'], cwd: ROOT });
+    const child = spawn(process.execPath, [entry], { stdio: ['pipe', 'pipe', 'pipe'], cwd });
     let buf = '';
     const pending = new Map();
     let settled = false;

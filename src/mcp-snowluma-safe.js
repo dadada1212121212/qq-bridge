@@ -18,7 +18,7 @@ import { z } from 'zod';
 // 在 MCP 里拦会连「安全拒绝理由」都拿不到，反而让模型无法把话说清楚。
 import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
-import { normEnum } from './mcp-args.js';
+import { normEnum, foldAliases, asArray, pickStrOrList, missingArgHint } from './mcp-args.js';
 
 // [养鱼 2026-10-21] 唤醒模式的常见说法归一。模型不会记得「潜水」在这个系统里叫 diving，
 // 它第一反应是 silent / quiet / normal——与其让它猜两轮，不如都认。
@@ -28,6 +28,28 @@ const WAKE_MODE_ALIASES = {
   潜水: 'diving', 静默: 'diving', 安静: 'diving', 睡觉: 'diving',
   active: 'active', awake: 'active', normal: 'active', on: 'active', wake: 'active',
   活跃: 'active', 正常: 'active', 醒着: 'active',
+};
+
+// [养鱼 2026-10-21] 唤醒配置的字段别名。实测模型传 triggers:{ at, name, keyword }，
+// 而规范名是 atMention / nameMention / keywords——zod 默认丢弃未声明的键，于是
+// 三个设置被静默吞掉、工具还返回 ok:true。这里把常见叫法折叠过去，认不出的明确报出来。
+const WAKE_TRIGGER_ALIASES = {
+  atMention: ['at', 'mention', 'at_mention', 'atmention', 'mentionMe'],
+  nameMention: ['name', 'name_mention', 'namemention', 'callName', 'called'],
+  keywords: ['keyword', 'kw', 'words', 'keywordList'],
+  speakerIds: ['speakers', 'speaker_ids', 'speakerids', 'ids', 'members'],
+  question: ['ask', 'questioned', 'challenge'],
+  poke: ['pat', 'tap', 'poked'],
+  anyMessage: ['any', 'any_message', 'anymessage', 'all', 'allMessages'],
+  probability: ['prob', 'p', 'rate', 'chance'],
+};
+const WAKE_CONFIG_ALIASES = {
+  mode: ['state', 'status', 'wakeMode'],
+  infinite: ['forever', 'unlimited', 'endless'],
+  sleepMs: ['sleep', 'durationMs', 'duration', 'ms', 'sleepDurationMs'],
+  sleepUntil: ['until', 'deadline', 'sleepUntilIso', 'wakeAt'],
+  triggers: ['trigger', 'conditions', 'wakeTriggers'],
+  batchWindowMs: ['batchMs', 'batchWindow', 'windowMs', 'batch_window_ms'],
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -602,30 +624,57 @@ server.tool(
         atMention: z.boolean().optional().describe('被 @ 或引用自己时唤醒'),
         nameMention: z.boolean().optional().describe('被叫名字/昵称时唤醒'),
         speakerIds: z.array(z.union([z.number(), z.string()])).max(20).optional().describe('指定群友 QQ 号数组：这些群友中任意一位发言时唤醒（可选，最多 20 个，不设置则不启用；私聊不适用，设置会被桥接清除；可从 qq_get_message_detail 的 userId/user_id，或 qq_account(action=get_group_member_list) 的成员列表获取）'),
-        keywords: z.array(z.string()).optional().describe('出现任意关键词时唤醒'),
+        keywords: z.union([z.string(), z.array(z.string())]).optional().describe('出现任意关键词时唤醒（可传数组，也可传 "大肥鱼,本鲸" 这样的字符串）'),
         question: z.boolean().optional().describe('被直接提问/点名挑战时唤醒'),
         poke: z.boolean().optional().describe('有人拍一拍时唤醒（群聊包括拍你和拍别人，私聊为对方拍你）'),
         anyMessage: z.boolean().optional().describe('任意新消息都唤醒（活跃模式）'),
         probability: z.number().optional().describe('普通消息按该概率随机唤醒（0~1）')
-      }).optional(),
+      }).passthrough().optional(),
       batchWindowMs: z.number().optional().describe('多条消息合并唤醒窗口（毫秒，>=1000）')
-    }).describe('要设置的唤醒配置，缺省字段保留原值')
+    }).passthrough().describe('要设置的唤醒配置，缺省字段保留原值')
   },
   async ({ key, token, config, throughSeq }) => {
     // [养鱼 2026-10-21] mode 原来是 z.enum(['diving','active'])。模型想"安静点"时会先猜
     // silent / quiet / normal，被 zod 直接挡掉，而报错只说 expected one of "diving"|"active"，
     // 它得再猜一次才知道该写 diving——实测就多烧了一轮。改成宽松字符串 + 归一，认不出才报错。
+    //
+    // 同一处更严重的坑：zod 的 object 默认**丢弃**未声明的键。实测模型传
+    // triggers:{ at, name, keyword }（该写 atMention / nameMention / keywords），
+    // 三个设置被静默吞掉，工具照样返回 ok:true——她以为设上了，实际一项没生效。
+    // 所以 schema 改 .passthrough()，在这里折叠别名，剩下的认不出的键**明确告诉她**。
     let cfgIn = config;
-    if (config && config.mode !== undefined && config.mode !== null && String(config.mode).trim() !== '') {
-      const mode = normEnum(config.mode, WAKE_MODE_ALIASES);
-      if (!mode) {
-        return { content: [{ type: 'text', text: `【参数错误】config.mode 只认 diving（潜水/安静）或 active（活跃/正常），你传的是「${config.mode}」。` }], isError: true };
+    const warns = [];
+    if (config && typeof config === 'object') {
+      const cf = foldAliases(config, WAKE_CONFIG_ALIASES);
+      cfgIn = { ...cf.value };
+      if (cf.value?.triggers && typeof cf.value.triggers === 'object') {
+        const tf = foldAliases(cf.value.triggers, WAKE_TRIGGER_ALIASES);
+        cfgIn.triggers = { ...tf.value };
+        if (cfgIn.triggers.keywords !== undefined) cfgIn.triggers.keywords = asArray(cfgIn.triggers.keywords);
+        if (tf.dropped.length) {
+          warns.push(`triggers 里这些字段不认识，已忽略：${tf.dropped.join(' / ')}`
+            + `\n    可用字段：${Object.keys(WAKE_TRIGGER_ALIASES).join(' / ')}`);
+        }
       }
-      cfgIn = { ...config, mode };
+      if (cf.dropped.length) {
+        warns.push(`config 里这些字段不认识，已忽略：${cf.dropped.join(' / ')}`
+          + `\n    可用字段：${Object.keys(WAKE_CONFIG_ALIASES).join(' / ')}`);
+      }
+    }
+    // 注意读 cfgIn 而不是 config：模型可能用 state/status 之类的别名传模式，
+    // 别名在上一段才被折叠进 cfgIn.mode，读原始 config.mode 会漏掉。
+    if (cfgIn && cfgIn.mode !== undefined && cfgIn.mode !== null && String(cfgIn.mode).trim() !== '') {
+      const mode = normEnum(cfgIn.mode, WAKE_MODE_ALIASES);
+      if (!mode) {
+        return { content: [{ type: 'text', text: `【参数错误】config.mode 只认 diving（潜水/安静）或 active（活跃/正常），你传的是「${cfgIn.mode}」。` }], isError: true };
+      }
+      cfgIn = { ...cfgIn, mode };
     }
     try {
       const data = await agentApi('/api/socialV2/wake-config', { method: 'POST', body: JSON.stringify({ key, config: cfgIn, throughSeq }), headers: { 'x-agent-token': token } });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      // 有字段被忽略时必须说出来：不然她拿到 ok:true，会以为全设上了。
+      const warn = warns.length ? `\n\n⚠️ 注意：这次有设置没生效——\n  ${warns.join('\n  ')}` : '';
+      return { content: [{ type: 'text', text: serializeModelData(data) + warn }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `设置唤醒配置失败：${error?.message ?? error}` }], isError: true };
     }
@@ -680,16 +729,26 @@ server.tool(
   {
     key: KEY_ARG,
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    messages: z.union([z.string(), z.array(z.string()).min(1)]).describe('要发送的内容：字符串=一条；数组=分多条'),
+    messages: z.union([z.string(), z.array(z.string()).min(1)]).optional().describe('要发送的内容：字符串=一条；数组=分多条（必填；传 message / text / content 也认）'),
+    message: z.union([z.string(), z.array(z.string())]).optional(),
+    text: z.union([z.string(), z.array(z.string())]).optional(),
+    content: z.union([z.string(), z.array(z.string())]).optional(),
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
     atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中用于点名某个人；与引用二选一即可，不要滥用）'),
     gapMode: z.enum(['auto', 'fixed', 'byLength']).optional().describe('auto=桥接随机；fixed=固定间隔；byLength=按字数计算'),
     gapMs: z.number().optional().describe('fixed 模式下的统一间隔（毫秒）'),
     gaps: z.array(z.number()).optional().describe('fixed 模式下逐条间隔（长度=条数-1）')
   },
-  async ({ key, token, messages, replyToMessageId, atUserId, gapMode, gapMs, gaps }) => {
+  async (args) => {
+    const { key, token, replyToMessageId, atUserId, gapMode, gapMs, gaps } = args;
+    // [养鱼 2026-10-21] messages 是最高频参数，模型很可能写成单数 message / text / content。
+    // 与其让它撞一次 zod 再重发（消息工具重发有重复发送的风险），不如都认。
+    const rawMessages = pickStrOrList(args, ['messages', 'message', 'text', 'content']);
+    if (rawMessages === undefined) {
+      return { content: [{ type: 'text', text: missingArgHint('qq_send_message', 'messages', '要发送的内容：字符串=一条，数组=分多条', args) }], isError: true };
+    }
     try {
-      let finalMessages = messages;
+      let finalMessages = rawMessages;
       if (typeof finalMessages === 'string') {
         const trimmed = finalMessages.trim();
         // 兼容模型把数组序列化成 JSON 字符串传入的情况，例如 "[...]"。
