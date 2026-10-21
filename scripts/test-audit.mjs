@@ -174,6 +174,8 @@ const tests = [
   'test-file-transfer.mjs',
   // [B 站养鱼] 配额/追更/评论纯逻辑。
   'test-bilibili-lib.mjs',
+  // [MCP 参数容错 2026-10-21] 模型猜错参数名（keyword/bvid/silent）不许再白烧一轮。
+  'test-mcp-args.mjs',
   // [小游戏 / 回合游戏 / 点歌] 纯逻辑 + 端点契约。
   'test-light-games.mjs', 'test-turn-games.mjs', 'test-music-links.mjs',
   // [印象 / 情景记忆 / 待办承诺] 记忆链路。

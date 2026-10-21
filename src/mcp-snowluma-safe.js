@@ -18,6 +18,17 @@ import { z } from 'zod';
 // 在 MCP 里拦会连「安全拒绝理由」都拿不到，反而让模型无法把话说清楚。
 import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
+import { normEnum } from './mcp-args.js';
+
+// [养鱼 2026-10-21] 唤醒模式的常见说法归一。模型不会记得「潜水」在这个系统里叫 diving，
+// 它第一反应是 silent / quiet / normal——与其让它猜两轮，不如都认。
+const WAKE_MODE_ALIASES = {
+  diving: 'diving', dive: 'diving', quiet: 'diving', silent: 'diving', sleep: 'diving',
+  sleeping: 'diving', idle: 'diving', off: 'diving', rest: 'diving', away: 'diving',
+  潜水: 'diving', 静默: 'diving', 安静: 'diving', 睡觉: 'diving',
+  active: 'active', awake: 'active', normal: 'active', on: 'active', wake: 'active',
+  活跃: 'active', 正常: 'active', 醒着: 'active',
+};
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -583,7 +594,7 @@ server.tool(
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
     throughSeq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional().describe('可同时确认已读：使用已查看结果中的 readThroughSeq，省去额外 qq_mark_read；不传则只设置唤醒配置。若 markRead 工具被关闭，该水位会被忽略，本工具只设置唤醒配置'),
     config: z.object({
-      mode: z.enum(['diving', 'active']).optional().describe('diving=潜水，active=活跃（anyMessage 开启）'),
+      mode: z.string().optional().describe('diving=潜水（安静，只有 @/叫名字/关键词/提问/拍一拍/概率命中才醒），active=活跃（任何消息都醒）。写 silent / quiet / sleep / 正常 这类常见说法也会被自动认成对应模式'),
       infinite: z.boolean().optional().describe('true=无限期，只有条件命中才唤醒；false=有限时间'),
       sleepMs: z.number().optional().describe('有限潜水毫秒数（从当前时间起算）'),
       sleepUntil: z.string().optional().describe('有限潜水截止时间 ISO 字符串，优先级高于 sleepMs'),
@@ -601,8 +612,19 @@ server.tool(
     }).describe('要设置的唤醒配置，缺省字段保留原值')
   },
   async ({ key, token, config, throughSeq }) => {
+    // [养鱼 2026-10-21] mode 原来是 z.enum(['diving','active'])。模型想"安静点"时会先猜
+    // silent / quiet / normal，被 zod 直接挡掉，而报错只说 expected one of "diving"|"active"，
+    // 它得再猜一次才知道该写 diving——实测就多烧了一轮。改成宽松字符串 + 归一，认不出才报错。
+    let cfgIn = config;
+    if (config && config.mode !== undefined && config.mode !== null && String(config.mode).trim() !== '') {
+      const mode = normEnum(config.mode, WAKE_MODE_ALIASES);
+      if (!mode) {
+        return { content: [{ type: 'text', text: `【参数错误】config.mode 只认 diving（潜水/安静）或 active（活跃/正常），你传的是「${config.mode}」。` }], isError: true };
+      }
+      cfgIn = { ...config, mode };
+    }
     try {
-      const data = await agentApi('/api/socialV2/wake-config', { method: 'POST', body: JSON.stringify({ key, config, throughSeq }), headers: { 'x-agent-token': token } });
+      const data = await agentApi('/api/socialV2/wake-config', { method: 'POST', body: JSON.stringify({ key, config: cfgIn, throughSeq }), headers: { 'x-agent-token': token } });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `设置唤醒配置失败：${error?.message ?? error}` }], isError: true };

@@ -8,12 +8,21 @@
 //
 // 数据层在 src/bilibili-lib.js（wbi 签名 / 风控兜底 / 格式化），这里只做工具壳。
 import { createBili, formatVideos } from './bilibili-lib.js';
+import { pickStr, missingArgHint, aliasFields } from './mcp-args.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+
+// [养鱼 2026-10-21] 参数别名：模型对同一个东西的叫法不固定，实测它先猜 keyword
+// 再猜 bvid，每次都撞在 zod 的「expected string at query」上白跑一轮。
+// 这里把常见叫法一并声明成可选，handler 里按优先级取——见 src/mcp-args.js。
+const Q_NAMES = ['query', 'keyword', 'keywords', 'q', 'text'];
+const V_NAMES = ['video', 'bvid', 'bv', 'url', 'link', 'videoId'];
+const U_NAMES = ['user', 'up', 'name', 'mid', 'uid'];
+const MSG_NAMES = ['message', 'content', 'text', 'comment', 'msg'];
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ACCOUNT_FILE = path.join(REPO_ROOT, 'state', 'bili-account.json');
@@ -63,11 +72,15 @@ server.tool(
   'bili_search',
   '只读搜索 B 站视频或 UP 主（官方公开接口，1-3 秒）。搜视频标题、UP 主昵称都行；结果一行一条带链接、播放数。不执行任何本地操作。',
   {
-    query: z.string().describe('要搜的关键词'),
+    query: z.string().optional().describe('要搜的关键词（必填；传 keyword / q 也认）'),
+    ...aliasFields(z, Q_NAMES, 'query'),
     kind: z.enum(['video', 'user']).optional().describe('搜什么：video=视频（默认），user=UP 主'),
     limit: z.number().int().min(1).max(10).optional().describe('要几条结果，默认 6')
   },
-  async ({ query, kind, limit }) => {
+  async (args) => {
+    const query = pickStr(args, Q_NAMES);
+    if (!query) return { content: [{ type: 'text', text: missingArgHint('bili_search', 'query', '要搜的关键词，比如「DeepSeek」', args) }], isError: true };
+    const { kind, limit } = args;
     try {
       const list = await bili.search(query, { kind: kind ?? 'video', limit: limit ?? 6 });
       const header = kind === 'user' ? '【B 站·UP 主搜索】' : '【B 站·视频搜索】';
@@ -86,8 +99,10 @@ server.tool(
 server.tool(
   'bili_video',
   '只读查 B 站视频详情：给 BV 号、av 号或 bilibili 视频链接，返回标题/UP主/播放/点赞/时长/简介。不执行任何本地操作。',
-  { video: z.string().describe('BV 号、av 号或 bilibili 视频链接（能从中认出 BV/av 即可）') },
-  async ({ video }) => {
+  { video: z.string().optional().describe('BV 号、av 号或 bilibili 视频链接（能从中认出 BV/av 即可）'), ...aliasFields(z, V_NAMES, 'video') },
+  async (args) => {
+    const video = pickStr(args, V_NAMES);
+    if (!video) return { content: [{ type: 'text', text: missingArgHint('bili_video', 'video', 'BV 号 / av 号 / 视频链接，比如 BV1JaJo6jEqH', args) }], isError: true };
     try {
       const v = await bili.videoInfo(video);
       const date = v.pubdate ? new Date(v.pubdate * 1000).toISOString().slice(0, 10) : '';
@@ -118,8 +133,10 @@ server.tool(
 server.tool(
   'bili_user',
   '只读查 B 站 UP 主信息：给昵称（会先搜人）或 mid，返回粉丝数/投稿数/签名。不执行任何本地操作。',
-  { user: z.string().describe('UP 主昵称或 mid（纯数字）') },
-  async ({ user }) => {
+  { user: z.string().optional().describe('UP 主昵称或 mid（纯数字）'), ...aliasFields(z, U_NAMES, 'user') },
+  async (args) => {
+    const user = pickStr(args, U_NAMES);
+    if (!user) return { content: [{ type: 'text', text: missingArgHint('bili_user', 'user', 'UP 主昵称或 mid', args) }], isError: true };
     try {
       const u = await bili.userInfo(user);
       const text = `【B 站·UP 主】${u.name}（mid=${u.mid}）\n粉丝 ${u.fans}｜投稿 ${u.videos}${u.sign ? '\n签名：' + u.sign.slice(0, 80) : ''}`;
@@ -134,11 +151,15 @@ server.tool(
   'bili_comments',
   '只读拉取 B 站视频的热门评论：给 BV 号或链接，返回评论人、内容、点赞数。想聊「大家怎么看这个视频」时用。不执行任何本地操作，不替你发评论。',
   {
-    video: z.string().describe('BV 号、av 号或 bilibili 视频链接'),
+    video: z.string().optional().describe('BV 号、av 号或 bilibili 视频链接'),
+    ...aliasFields(z, V_NAMES, 'video'),
     sort: z.enum(['hot', 'time']).optional().describe('排序：hot=最热（默认），time=最新'),
     limit: z.number().int().min(1).max(15).optional().describe('要几条，默认 8')
   },
-  async ({ video, sort, limit }) => {
+  async (args) => {
+    const video = pickStr(args, V_NAMES);
+    if (!video) return { content: [{ type: 'text', text: missingArgHint('bili_comments', 'video', 'BV 号 / av 号 / 视频链接', args) }], isError: true };
+    const { sort, limit } = args;
     try {
       const r = await bili.comments(video, { sort: sort ?? 'hot', limit: limit ?? 8 });
       const head = `【B 站·评论】${r.title || '视频 ' + r.aid}（共 ${r.total} 条）\n`;
@@ -156,10 +177,14 @@ server.tool(
   'bili_user_videos',
   '只读拉取 B 站 UP 主的最近投稿列表：给昵称或 mid，返回最新几条视频。想追某个 UP 的更新时用。不执行任何本地操作。',
   {
-    user: z.string().describe('UP 主昵称或 mid（纯数字）'),
+    user: z.string().optional().describe('UP 主昵称或 mid（纯数字）'),
+    ...aliasFields(z, U_NAMES, 'user'),
     limit: z.number().int().min(1).max(10).optional().describe('要几条，默认 5')
   },
-  async ({ user, limit }) => {
+  async (args) => {
+    const user = pickStr(args, U_NAMES);
+    if (!user) return { content: [{ type: 'text', text: missingArgHint('bili_user_videos', 'user', 'UP 主昵称或 mid', args) }], isError: true };
+    const { limit } = args;
     try {
       const r = await bili.userVideos(user, { limit: limit ?? 5 });
       const header = `【B 站·${r.name || user} 的最近投稿】`;
@@ -177,10 +202,14 @@ server.tool(
   'bili_anime',
   '只读搜索 B 站的番剧/国创/纪录片/影视条目：给名字（支持别名，比如「葬送的芙莉莲」），返回年份/类型/简介/观看链接。不执行任何本地操作。',
   {
-    query: z.string().describe('番剧或影视名'),
+    query: z.string().optional().describe('番剧或影视名'),
+    ...aliasFields(z, Q_NAMES, 'query'),
     limit: z.number().int().min(1).max(8).optional().describe('要几条，默认 5')
   },
-  async ({ query, limit }) => {
+  async (args) => {
+    const query = pickStr(args, Q_NAMES);
+    if (!query) return { content: [{ type: 'text', text: missingArgHint('bili_anime', 'query', '番剧或影视名', args) }], isError: true };
+    const { limit } = args;
     try {
       const list = await bili.animeSearch(query, { limit: limit ?? 5 });
       const text = list.length
@@ -220,11 +249,18 @@ server.tool(
   'bili_post_comment',
   '以肥鱼号身份在 B 站视频下发一条评论。**先用你自己的口吻写**（你是蓝色大肥鱼，评论也要像你），别复制别人的、别引战辱骂。硬频控：每天 5 条、同类间隔 30 分钟、同视频只评一次。要回复别人的评论（比如你的评论收到了回复）时传 root=那条评论的 rpid，这时不限「同视频一次」但仍占每日额度。',
   {
-    video: z.string().describe('BV 号、av 号或 bilibili 视频链接'),
-    message: z.string().describe('评论内容（用你的口吻，短句最好，≤500 字）'),
+    video: z.string().optional().describe('BV 号、av 号或 bilibili 视频链接'),
+    ...aliasFields(z, V_NAMES, 'video'),
+    message: z.string().optional().describe('评论内容（用你的口吻，短句最好，≤500 字）'),
+    ...aliasFields(z, MSG_NAMES, 'message'),
     root: z.string().optional().describe('要回复的评论 rpid（盖楼回复时传，普通评论不传）')
   },
-  async ({ video, message, root }) => {
+  async (args) => {
+    const video = pickStr(args, V_NAMES);
+    const message = pickStr(args, MSG_NAMES);
+    const { root } = args;
+    if (!video) return { content: [{ type: 'text', text: missingArgHint('bili_post_comment', 'video', 'BV 号 / av 号 / 视频链接', args) }], isError: true };
+    if (!message) return { content: [{ type: 'text', text: missingArgHint('bili_post_comment', 'message', '评论正文', args) }], isError: true };
     if (!accountConfigured()) {
       return { content: [{ type: 'text', text: '【B 站】账号还没接入，发不了评论：请主人导一次登录 cookie 到 state/bili-account.json。' }], isError: true };
     }
