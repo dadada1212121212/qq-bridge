@@ -2,7 +2,7 @@
 // 真机冒烟（view/search/popular/card 四接口）在实现当晚已人工跑通；这里只测纯逻辑，CI 可离线跑。
 import assert from 'node:assert/strict';
 import {
-  mixinKey, wbiSign, parseVideoId, stripEm, formatVideos, formatDuration, createBili, parseQrLoginUrl
+  mixinKey, wbiSign, parseVideoId, stripEm, formatVideos, formatDuration, createBili, parseQrLoginUrl, parseNavAccount
 } from '../src/bilibili-lib.js';
 
 let pass = 0;
@@ -192,6 +192,25 @@ ok('parseQrLoginUrl：缺字段返回空串不抛', () => {
   const r = parseQrLoginUrl('https://x/crossDomain?foo=1');
   assert.deepEqual(r, { SESSDATA: '', bili_jct: '', DedeUserID: '' });
   assert.deepEqual(parseQrLoginUrl(''), { SESSDATA: '', bili_jct: '', DedeUserID: '' });
+});
+
+// nav 账号信息归一（2026-10-21 补）
+ok('parseNavAccount：等级取 level_info.current_level', () => {
+  // 真实 nav 返回里没有 data.level，等级在 level_info.current_level。
+  // 原来直接读 d.level ⇒ 打印成 "Lv.undefined"。
+  const r = parseNavAccount({ mid: 3546974573824927, uname: '纱雾的蓝色肥鱼', level_info: { current_level: 2 }, money: 24, isLogin: true });
+  assert.equal(r.level, 2);
+  assert.equal(r.coin, 24);
+  assert.equal(r.mid, '3546974573824927');
+  assert.equal(r.isLogin, true);
+});
+ok('parseNavAccount：字段缺失不炸', () => {
+  const r = parseNavAccount({});
+  assert.equal(r.level, 0);
+  assert.equal(r.coin, 0);
+  assert.equal(r.uname, '');
+  assert.equal(r.isLogin, false);
+  assert.deepEqual(parseNavAccount(undefined).level, 0);
 });
 
 console.log(`test-bilibili-lib: ${pass} 断言通过${process.exitCode ? '（存在失败）' : ''}`);

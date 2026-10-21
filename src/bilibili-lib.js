@@ -343,8 +343,7 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
     const j = await rawJson(`${API}/x/web-interface/nav`, { auth: true });
     if (j?.code === -101) throw new Error('cookie 已失效（B 站把这次请求当游客了）——重新导出一次登录 cookie');
     if (j?.code !== 0) throw new Error(`nav 返回 ${j?.code}: ${j?.message || ''}`);
-    const d = j.data;
-    return { mid: String(d.mid), uname: d.uname, level: d.level, coin: d.money, isLogin: !!d.isLogin };
+    return parseNavAccount(j.data);
   }
 
   /** 以她的名义发一条评论（频控内）。input 支持 BV/av/链接。 */
@@ -473,6 +472,23 @@ export function createBili({ fetchImpl, log = () => {} } = {}) {
 }
 
 /** 去掉搜索结果标题里的 <em class="keyword"> 高亮标签。 */
+/**
+ * nav 接口的 `data` → 统一的账号信息。
+ *
+ * ⚠️ 等级在 `level_info.current_level`，**不是** `data.level`（后者不存在）。
+ * 原来直接读 `d.level` ⇒ 打印出来是 "Lv.undefined"。老版本接口可能有 data.level，留作兜底。
+ */
+export function parseNavAccount(d) {
+  const data = d || {};
+  return {
+    mid: String(data.mid ?? ''),
+    uname: String(data.uname ?? ''),
+    level: Number(data.level_info?.current_level ?? data.level ?? 0) || 0,
+    coin: Number(data.money ?? 0) || 0,
+    isLogin: !!data.isLogin,
+  };
+}
+
 /**
  * 从「扫码登录成功后 B 站回调的那个 URL」里取出 cookie 三件套。
  *
